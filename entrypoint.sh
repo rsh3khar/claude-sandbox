@@ -37,6 +37,31 @@ SSHEOF
 chmod 700 ~/.ssh
 chmod 600 ~/.ssh/* 2>/dev/null || true
 
+# Resolve broken skill symlinks (they point to ~/.agents which isn't mounted)
+resolve_skill_symlinks() {
+    local skills_dir="$HOME/.claude/skills"
+    [[ ! -d "$skills_dir" ]] && return
+
+    for link in "$skills_dir"/*; do
+        [[ ! -L "$link" ]] && continue
+
+        local name=$(basename "$link")
+
+        # Check if symlink target exists
+        if [[ ! -e "$link" ]]; then
+            # Try plugins cache
+            local plugin_path=$(find "$HOME/.claude/plugins" -type d -name "$name" -path "*/skills/*" 2>/dev/null | head -1)
+            if [[ -n "$plugin_path" && -d "$plugin_path" ]]; then
+                rm "$link"
+                cp -r "$plugin_path" "$skills_dir/$name"
+                echo -e "${C_DIM}Resolved skill: ${name}${NC}"
+            fi
+        fi
+    done
+}
+
+resolve_skill_symlinks
+
 # Extract repo name from URL
 REPO_NAME=$(basename "$GIT_URL" .git)
 
