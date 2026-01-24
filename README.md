@@ -204,6 +204,40 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 # → http://localhost:8000
 ```
 
+## Screenshot Sharing
+
+Claude inside the container can't access your clipboard. To share screenshots:
+
+**Option 1: Let installer configure it**
+
+The installer will ask to change your macOS screenshot save location to `~/.claude/screenshots/`. Then:
+1. Take screenshot (Cmd+Shift+4)
+2. Tell Claude "check the screenshot"
+
+**Option 2: Manual setup**
+
+```bash
+mkdir -p ~/.claude/screenshots
+defaults write com.apple.screencapture location ~/.claude/screenshots
+killall SystemUIServer
+```
+
+**Option 3: One-off sharing**
+
+```bash
+# Install pngpaste
+brew install pngpaste
+
+# Copy clipboard to shared folder
+pngpaste ~/.claude/screenshots/shot.png
+```
+
+**To restore default screenshot location:**
+```bash
+defaults write com.apple.screencapture location ~/Desktop
+killall SystemUIServer
+```
+
 ## Troubleshooting
 
 ### SSH not working

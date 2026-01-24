@@ -442,6 +442,30 @@ else
     fi
 fi
 
+# Screenshot sharing setup (macOS only)
+if [[ "$OS" == "macos" ]]; then
+    echo ""
+    echo -e "${C_TEXT}Screenshot sharing...${NC}"
+    echo ""
+    echo -e "  ${C_DIM}Claude inside the sandbox can't access your clipboard.${NC}"
+    echo -e "  ${C_DIM}To share screenshots, we can change where macOS saves them.${NC}"
+    echo ""
+    echo -e "  ${C_DIM}Current location:${NC} $(defaults read com.apple.screencapture location 2>/dev/null || echo "~/Desktop")"
+    echo -e "  ${C_DIM}New location:${NC}     ${C_ACCENT}~/.claude/screenshots/${NC}"
+    echo ""
+    read -p "Change screenshot save location? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        mkdir -p "$HOME/.claude/screenshots"
+        defaults write com.apple.screencapture location "$HOME/.claude/screenshots"
+        killall SystemUIServer 2>/dev/null || true
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Screenshots now save to ~/.claude/screenshots/"
+        echo -e "  ${C_DIM}  Take screenshot (Cmd+Shift+4) → Claude can see it${NC}"
+    else
+        echo -e "  ${C_DIM}-${NC} Skipped (you can set this up later)"
+    fi
+fi
+
 # Done!
 echo ""
 echo -e "${C_SUCCESS}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
