@@ -2,12 +2,7 @@
 
 Run [Claude Code](https://claude.ai/code) with `--dangerously-skip-permissions` safely in an isolated Docker container.
 
-```
-◈ CLAUDE SANDBOX
-
-  Run Claude Code with --dangerously-skip-permissions
-       safely in an isolated container
-```
+![Claude Sandbox](screenshot.png)
 
 ## Why?
 
