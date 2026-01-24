@@ -16,12 +16,168 @@ CHECK="✓"
 CROSS="✗"
 ARROW="→"
 
+# Install locations
+INSTALL_DIR="$HOME/.claude-sandbox"
+BIN_DIR="$HOME/.local/bin"
+TOKEN_FILE="$HOME/.claude-sandbox-token"
+
+# Get script directory (where install.sh lives)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Parse arguments
+MODE="install"
+SKIP_DEPS=false
+SKIP_BUILD=false
+
+show_help() {
+    echo ""
+    echo -e "${C_ACCENT}${BOLD}◈ CLAUDE SANDBOX INSTALLER${NC}"
+    echo ""
+    echo -e "${C_TEXT}Usage:${NC}"
+    echo -e "  ./install.sh              ${C_DIM}# Normal install (copies files)${NC}"
+    echo -e "  ./install.sh --link       ${C_DIM}# Dev mode (symlinks to repo)${NC}"
+    echo -e "  ./install.sh --uninstall  ${C_DIM}# Remove claude-sandbox${NC}"
+    echo -e "  ./install.sh --update     ${C_DIM}# Rebuild Docker image only${NC}"
+    echo ""
+    echo -e "${C_TEXT}Options:${NC}"
+    echo -e "  --link        ${C_DIM}Symlink ~/.claude-sandbox to this repo (for development)${NC}"
+    echo -e "  --uninstall   ${C_DIM}Remove installed files and Docker image${NC}"
+    echo -e "  --update      ${C_DIM}Rebuild Docker image without reinstalling${NC}"
+    echo -e "  --skip-deps   ${C_DIM}Skip dependency checks${NC}"
+    echo -e "  --skip-build  ${C_DIM}Skip Docker image build${NC}"
+    echo -e "  --help        ${C_DIM}Show this help message${NC}"
+    echo ""
+}
+
+for arg in "$@"; do
+    case $arg in
+        --link)
+            MODE="link"
+            ;;
+        --uninstall)
+            MODE="uninstall"
+            ;;
+        --update)
+            MODE="update"
+            ;;
+        --skip-deps)
+            SKIP_DEPS=true
+            ;;
+        --skip-build)
+            SKIP_BUILD=true
+            ;;
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo -e "${C_ERROR}Unknown option: $arg${NC}"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# ============================================================================
+# UNINSTALL
+# ============================================================================
+
+if [[ "$MODE" == "uninstall" ]]; then
+    echo ""
+    echo -e "${C_ACCENT}${BOLD}◈ CLAUDE SANDBOX UNINSTALLER${NC}"
+    echo ""
+
+    # Remove install directory
+    if [[ -e "$INSTALL_DIR" ]]; then
+        rm -rf "$INSTALL_DIR"
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Removed ${INSTALL_DIR}"
+    else
+        echo -e "  ${C_DIM}-${NC} ${INSTALL_DIR} not found"
+    fi
+
+    # Remove symlink
+    if [[ -L "$BIN_DIR/claude-sandbox" ]]; then
+        rm "$BIN_DIR/claude-sandbox"
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Removed symlink from ${BIN_DIR}"
+    else
+        echo -e "  ${C_DIM}-${NC} Symlink not found"
+    fi
+
+    # Remove Docker image
+    if docker image inspect claude-sandbox &>/dev/null; then
+        docker rmi claude-sandbox --force &>/dev/null
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Removed Docker image"
+    else
+        echo -e "  ${C_DIM}-${NC} Docker image not found"
+    fi
+
+    # Ask about token file
+    if [[ -f "$TOKEN_FILE" ]]; then
+        echo ""
+        read -p "Remove OAuth token file (~/.claude-sandbox-token)? [y/N] " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            rm "$TOKEN_FILE"
+            echo -e "  ${C_SUCCESS}${CHECK}${NC} Removed token file"
+        else
+            echo -e "  ${C_DIM}-${NC} Kept token file"
+        fi
+    fi
+
+    echo ""
+    echo -e "${C_SUCCESS}${CHECK}${NC} ${C_TEXT}Uninstall complete${NC}"
+    echo ""
+    exit 0
+fi
+
+# ============================================================================
+# UPDATE (rebuild Docker image only)
+# ============================================================================
+
+if [[ "$MODE" == "update" ]]; then
+    echo ""
+    echo -e "${C_ACCENT}${BOLD}◈ CLAUDE SANDBOX UPDATER${NC}"
+    echo ""
+
+    # Check if installed
+    if [[ ! -e "$INSTALL_DIR" ]]; then
+        echo -e "${C_ERROR}${CROSS}${NC} Claude Sandbox not installed. Run ./install.sh first."
+        exit 1
+    fi
+
+    echo -e "${C_TEXT}Rebuilding Docker image...${NC}"
+    echo ""
+
+    if docker build -t claude-sandbox "$INSTALL_DIR" 2>&1 | while read -r line; do
+        echo -e "  ${C_DIM}${line}${NC}"
+    done; then
+        echo ""
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Docker image rebuilt"
+    else
+        echo ""
+        echo -e "  ${C_ERROR}${CROSS}${NC} Docker build failed"
+        exit 1
+    fi
+
+    echo ""
+    exit 0
+fi
+
+# ============================================================================
+# INSTALL / LINK
+# ============================================================================
+
 echo ""
 echo -e "${C_ACCENT}${BOLD}◈ CLAUDE SANDBOX INSTALLER${NC}"
 echo ""
 echo -e "${C_DIM}Run Claude Code with --dangerously-skip-permissions${NC}"
 echo -e "${C_DIM}safely in an isolated Docker container${NC}"
 echo ""
+
+if [[ "$MODE" == "link" ]]; then
+    echo -e "${C_WARN}${BOLD}Developer mode:${NC} ${C_DIM}Will symlink to this repo${NC}"
+    echo ""
+fi
 
 # Detect OS
 OS="unknown"
@@ -61,128 +217,160 @@ install_dep() {
     fi
 }
 
-# Check dependencies
-echo -e "${C_TEXT}Checking dependencies...${NC}"
-echo ""
-
-MISSING=()
-
-# Docker
-if check_cmd docker; then
-    echo -e "  ${C_SUCCESS}${CHECK}${NC} docker"
-else
-    echo -e "  ${C_ERROR}${CROSS}${NC} docker ${C_DIM}(required)${NC}"
-    MISSING+=("docker")
-fi
-
-# GitHub CLI
-if check_cmd gh; then
-    echo -e "  ${C_SUCCESS}${CHECK}${NC} gh"
-else
-    echo -e "  ${C_ERROR}${CROSS}${NC} gh ${C_DIM}(GitHub CLI)${NC}"
-    MISSING+=("gh")
-fi
-
-# gum (for interactive prompts)
-if check_cmd gum; then
-    echo -e "  ${C_SUCCESS}${CHECK}${NC} gum"
-else
-    echo -e "  ${C_ERROR}${CROSS}${NC} gum ${C_DIM}(interactive prompts)${NC}"
-    MISSING+=("gum")
-fi
-
-# jq (for JSON parsing)
-if check_cmd jq; then
-    echo -e "  ${C_SUCCESS}${CHECK}${NC} jq"
-else
-    echo -e "  ${C_ERROR}${CROSS}${NC} jq ${C_DIM}(JSON parsing)${NC}"
-    MISSING+=("jq")
-fi
-
-echo ""
-
-# Handle missing dependencies
-if [[ ${#MISSING[@]} -gt 0 ]]; then
-    echo -e "${C_WARN}Missing dependencies: ${MISSING[*]}${NC}"
+# Check dependencies (unless skipped)
+if [[ "$SKIP_DEPS" == "false" ]]; then
+    echo -e "${C_TEXT}Checking dependencies...${NC}"
     echo ""
 
-    # Special handling for Docker
-    if [[ " ${MISSING[*]} " =~ " docker " ]]; then
-        echo -e "${C_TEXT}Docker is required. Install one of:${NC}"
-        echo -e "  ${C_DIM}•${NC} OrbStack (recommended): ${C_TEXT}brew install orbstack${NC}"
-        echo -e "  ${C_DIM}•${NC} Docker Desktop: ${C_TEXT}brew install --cask docker${NC}"
-        echo ""
-        echo -e "${C_DIM}After installing Docker, run this installer again.${NC}"
-        exit 1
+    MISSING=()
+
+    # Docker
+    if check_cmd docker; then
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} docker"
+    else
+        echo -e "  ${C_ERROR}${CROSS}${NC} docker ${C_DIM}(required)${NC}"
+        MISSING+=("docker")
     fi
 
-    # Offer to install other missing deps
-    if [[ "$HAS_BREW" == "true" || "$OS" == "linux" ]]; then
-        read -p "Install missing dependencies? [Y/n] " -n 1 -r
+    # GitHub CLI
+    if check_cmd gh; then
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} gh"
+    else
+        echo -e "  ${C_ERROR}${CROSS}${NC} gh ${C_DIM}(GitHub CLI)${NC}"
+        MISSING+=("gh")
+    fi
+
+    # gum (for interactive prompts)
+    if check_cmd gum; then
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} gum"
+    else
+        echo -e "  ${C_ERROR}${CROSS}${NC} gum ${C_DIM}(interactive prompts)${NC}"
+        MISSING+=("gum")
+    fi
+
+    # jq (for JSON parsing)
+    if check_cmd jq; then
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} jq"
+    else
+        echo -e "  ${C_ERROR}${CROSS}${NC} jq ${C_DIM}(JSON parsing)${NC}"
+        MISSING+=("jq")
+    fi
+
+    echo ""
+
+    # Handle missing dependencies
+    if [[ ${#MISSING[@]} -gt 0 ]]; then
+        echo -e "${C_WARN}Missing dependencies: ${MISSING[*]}${NC}"
         echo ""
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            for dep in "${MISSING[@]}"; do
-                if [[ "$dep" != "docker" ]]; then
-                    install_dep "$dep"
-                fi
-            done
+
+        # Special handling for Docker
+        if [[ " ${MISSING[*]} " =~ " docker " ]]; then
+            echo -e "${C_TEXT}Docker is required. Install one of:${NC}"
+            echo -e "  ${C_DIM}•${NC} OrbStack (recommended): ${C_TEXT}brew install orbstack${NC}"
+            echo -e "  ${C_DIM}•${NC} Docker Desktop: ${C_TEXT}brew install --cask docker${NC}"
             echo ""
-        else
-            echo -e "${C_DIM}Please install missing dependencies and run again.${NC}"
+            echo -e "${C_DIM}After installing Docker, run this installer again.${NC}"
             exit 1
         fi
+
+        # Offer to install other missing deps
+        if [[ "$HAS_BREW" == "true" || "$OS" == "linux" ]]; then
+            read -p "Install missing dependencies? [Y/n] " -n 1 -r
+            echo ""
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                for dep in "${MISSING[@]}"; do
+                    if [[ "$dep" != "docker" ]]; then
+                        install_dep "$dep"
+                    fi
+                done
+                echo ""
+            else
+                echo -e "${C_DIM}Please install missing dependencies and run again.${NC}"
+                exit 1
+            fi
+        else
+            echo -e "${C_ERROR}Cannot auto-install dependencies.${NC}"
+            echo -e "${C_DIM}Please install: ${MISSING[*]}${NC}"
+            exit 1
+        fi
+    fi
+
+    # Check GitHub auth
+    echo -e "${C_TEXT}Checking GitHub authentication...${NC}"
+    if gh auth status &>/dev/null; then
+        GH_USER=$(gh api user --jq '.login' 2>/dev/null || echo "unknown")
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Logged in as ${C_ACCENT}@${GH_USER}${NC}"
     else
-        echo -e "${C_ERROR}Cannot auto-install dependencies.${NC}"
-        echo -e "${C_DIM}Please install: ${MISSING[*]}${NC}"
-        exit 1
+        echo -e "  ${C_WARN}!${NC} Not logged in to GitHub"
+        echo ""
+        read -p "Login to GitHub now? [Y/n] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            gh auth login
+        fi
     fi
+    echo ""
 fi
 
-# Check GitHub auth
-echo -e "${C_TEXT}Checking GitHub authentication...${NC}"
-if gh auth status &>/dev/null; then
-    GH_USER=$(gh api user --jq '.login' 2>/dev/null || echo "unknown")
-    echo -e "  ${C_SUCCESS}${CHECK}${NC} Logged in as ${C_ACCENT}@${GH_USER}${NC}"
-else
-    echo -e "  ${C_WARN}!${NC} Not logged in to GitHub"
-    echo ""
-    read -p "Login to GitHub now? [Y/n] " -n 1 -r
-    echo ""
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        gh auth login
-    fi
-fi
-echo ""
-
-# Install location
-INSTALL_DIR="$HOME/.claude-sandbox"
-BIN_DIR="$HOME/.local/bin"
-
-echo -e "${C_TEXT}Installing to ${C_ACCENT}${INSTALL_DIR}${NC}..."
-echo ""
-
-# Create directories
-mkdir -p "$INSTALL_DIR"
+# Create bin directory
 mkdir -p "$BIN_DIR"
 
-# Get script directory (where install.sh lives)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Install based on mode
+if [[ "$MODE" == "link" ]]; then
+    # Developer mode: symlink to repo
+    echo -e "${C_TEXT}Linking to ${C_ACCENT}${SCRIPT_DIR}${NC}..."
+    echo ""
 
-# Copy files
-cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/claude-sandbox" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/entrypoint.sh" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/auto-git.sh" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/p10k.zsh" "$INSTALL_DIR/"
+    # Remove existing install dir if it's not already a symlink to this repo
+    if [[ -e "$INSTALL_DIR" ]]; then
+        if [[ -L "$INSTALL_DIR" ]]; then
+            CURRENT_TARGET=$(readlink "$INSTALL_DIR")
+            if [[ "$CURRENT_TARGET" == "$SCRIPT_DIR" ]]; then
+                echo -e "  ${C_DIM}-${NC} Already linked to this repo"
+            else
+                rm "$INSTALL_DIR"
+                ln -s "$SCRIPT_DIR" "$INSTALL_DIR"
+                echo -e "  ${C_SUCCESS}${CHECK}${NC} Updated symlink to this repo"
+            fi
+        else
+            rm -rf "$INSTALL_DIR"
+            ln -s "$SCRIPT_DIR" "$INSTALL_DIR"
+            echo -e "  ${C_SUCCESS}${CHECK}${NC} Replaced install with symlink to repo"
+        fi
+    else
+        ln -s "$SCRIPT_DIR" "$INSTALL_DIR"
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Created symlink: ${INSTALL_DIR} → ${SCRIPT_DIR}"
+    fi
+else
+    # Normal mode: copy files
+    echo -e "${C_TEXT}Installing to ${C_ACCENT}${INSTALL_DIR}${NC}..."
+    echo ""
 
-# Make executable
-chmod +x "$INSTALL_DIR/claude-sandbox"
-chmod +x "$INSTALL_DIR/entrypoint.sh"
-chmod +x "$INSTALL_DIR/auto-git.sh"
+    # Remove if symlink (switching from dev mode)
+    if [[ -L "$INSTALL_DIR" ]]; then
+        rm "$INSTALL_DIR"
+        echo -e "  ${C_DIM}-${NC} Removed dev symlink"
+    fi
 
-echo -e "  ${C_SUCCESS}${CHECK}${NC} Copied files to ${INSTALL_DIR}"
+    # Create directory
+    mkdir -p "$INSTALL_DIR"
 
-# Create symlink
+    # Copy files
+    cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/claude-sandbox" "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/entrypoint.sh" "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/auto-git.sh" "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/p10k.zsh" "$INSTALL_DIR/"
+
+    # Make executable
+    chmod +x "$INSTALL_DIR/claude-sandbox"
+    chmod +x "$INSTALL_DIR/entrypoint.sh"
+    chmod +x "$INSTALL_DIR/auto-git.sh"
+
+    echo -e "  ${C_SUCCESS}${CHECK}${NC} Copied files to ${INSTALL_DIR}"
+fi
+
+# Create symlink to binary
 ln -sf "$INSTALL_DIR/claude-sandbox" "$BIN_DIR/claude-sandbox"
 echo -e "  ${C_SUCCESS}${CHECK}${NC} Created symlink in ${BIN_DIR}"
 
@@ -196,21 +384,23 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo ""
 fi
 
-# Build Docker image
-echo ""
-echo -e "${C_TEXT}Building Docker image...${NC}"
-echo -e "${C_DIM}(this may take a few minutes on first run)${NC}"
-echo ""
+# Build Docker image (unless skipped)
+if [[ "$SKIP_BUILD" == "false" ]]; then
+    echo ""
+    echo -e "${C_TEXT}Building Docker image...${NC}"
+    echo -e "${C_DIM}(this may take a few minutes on first run)${NC}"
+    echo ""
 
-if docker build -t claude-sandbox "$INSTALL_DIR" 2>&1 | while read -r line; do
-    echo -e "  ${C_DIM}${line}${NC}"
-done; then
-    echo ""
-    echo -e "  ${C_SUCCESS}${CHECK}${NC} Docker image built"
-else
-    echo ""
-    echo -e "  ${C_ERROR}${CROSS}${NC} Docker build failed"
-    exit 1
+    if docker build -t claude-sandbox "$INSTALL_DIR" 2>&1 | while read -r line; do
+        echo -e "  ${C_DIM}${line}${NC}"
+    done; then
+        echo ""
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Docker image built"
+    else
+        echo ""
+        echo -e "  ${C_ERROR}${CROSS}${NC} Docker build failed"
+        exit 1
+    fi
 fi
 
 # Claude Code authentication
@@ -218,7 +408,7 @@ echo ""
 echo -e "${C_TEXT}Claude Code authentication...${NC}"
 echo ""
 
-if [[ -f "$HOME/.claude-sandbox-token" ]]; then
+if [[ -f "$TOKEN_FILE" ]]; then
     echo -e "  ${C_SUCCESS}${CHECK}${NC} Token file exists at ~/.claude-sandbox-token"
 else
     echo -e "  ${C_DIM}Claude Code needs an OAuth token to work in the container.${NC}"
@@ -244,8 +434,8 @@ else
         read -r TOKEN
 
         if [[ -n "$TOKEN" ]]; then
-            echo "$TOKEN" > "$HOME/.claude-sandbox-token"
-            chmod 600 "$HOME/.claude-sandbox-token"
+            echo "$TOKEN" > "$TOKEN_FILE"
+            chmod 600 "$TOKEN_FILE"
             echo ""
             echo -e "  ${C_SUCCESS}${CHECK}${NC} Token saved to ~/.claude-sandbox-token"
         fi
@@ -258,6 +448,13 @@ echo -e "${C_SUCCESS}━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo -e "  ${C_SUCCESS}${CHECK}${NC} ${C_TEXT}${BOLD}Installation complete!${NC}"
 echo ""
+
+if [[ "$MODE" == "link" ]]; then
+    echo -e "  ${C_WARN}${BOLD}Dev mode:${NC} ${C_DIM}Changes in repo take effect immediately${NC}"
+    echo -e "  ${C_DIM}Run ${C_ACCENT}./install.sh --update${C_DIM} to rebuild Docker image${NC}"
+    echo ""
+fi
+
 echo -e "  ${C_DIM}Run ${C_ACCENT}claude-sandbox${C_DIM} or ${C_ACCENT}cs${C_DIM} to start${NC}"
 echo ""
 echo -e "  ${C_DIM}Tip: Add an alias to your shell config:${NC}"

@@ -57,6 +57,24 @@ The installer will:
 2. Build the Docker image
 3. Set up Claude Code authentication
 
+### Developer Mode
+
+For contributors who want changes to take effect immediately:
+
+```bash
+./install.sh --link    # Symlinks ~/.claude-sandbox to repo
+./install.sh --update  # Rebuild Docker image after changes
+```
+
+### Other Commands
+
+```bash
+./install.sh --help       # Show all options
+./install.sh --uninstall  # Remove claude-sandbox completely
+./install.sh --skip-deps  # Skip dependency checks
+./install.sh --skip-build # Skip Docker image build
+```
+
 ## Usage
 
 ### Interactive Mode
