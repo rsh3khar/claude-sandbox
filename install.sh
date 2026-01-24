@@ -21,8 +21,17 @@ INSTALL_DIR="$HOME/.claude-sandbox"
 BIN_DIR="$HOME/.local/bin"
 TOKEN_FILE="$HOME/.claude-sandbox-token"
 
-# Get script directory (where install.sh lives)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# GitHub raw URL for downloading files
+GITHUB_RAW="https://raw.githubusercontent.com/rsh3khar/claude-sandbox/main"
+
+# Detect if running from pipe (curl | bash) or from local file
+if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    FROM_PIPE=false
+else
+    SCRIPT_DIR=""
+    FROM_PIPE=true
+fi
 
 # Parse arguments
 MODE="install"
@@ -318,6 +327,11 @@ mkdir -p "$BIN_DIR"
 # Install based on mode
 if [[ "$MODE" == "link" ]]; then
     # Developer mode: symlink to repo
+    if [[ "$FROM_PIPE" == true ]]; then
+        echo -e "${C_ERROR}${CROSS} --link requires running from cloned repo, not curl | bash${NC}"
+        echo -e "${C_DIM}  Clone the repo first: git clone https://github.com/rsh3khar/claude-sandbox${NC}"
+        exit 1
+    fi
     echo -e "${C_TEXT}Linking to ${C_ACCENT}${SCRIPT_DIR}${NC}..."
     echo ""
 
@@ -342,7 +356,7 @@ if [[ "$MODE" == "link" ]]; then
         echo -e "  ${C_SUCCESS}${CHECK}${NC} Created symlink: ${INSTALL_DIR} → ${SCRIPT_DIR}"
     fi
 else
-    # Normal mode: copy files
+    # Normal mode: copy or download files
     echo -e "${C_TEXT}Installing to ${C_ACCENT}${INSTALL_DIR}${NC}..."
     echo ""
 
@@ -355,20 +369,31 @@ else
     # Create directory
     mkdir -p "$INSTALL_DIR"
 
-    # Copy files
-    cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/"
-    cp "$SCRIPT_DIR/claude-sandbox" "$INSTALL_DIR/"
-    cp "$SCRIPT_DIR/entrypoint.sh" "$INSTALL_DIR/"
-    cp "$SCRIPT_DIR/auto-git.sh" "$INSTALL_DIR/"
-    cp "$SCRIPT_DIR/p10k.zsh" "$INSTALL_DIR/"
-    cp "$SCRIPT_DIR/sandbox-context.md" "$INSTALL_DIR/"
+    if [[ "$FROM_PIPE" == true ]]; then
+        # Download files from GitHub
+        echo -e "  ${C_DIM}Downloading from GitHub...${NC}"
+        curl -fsSL "$GITHUB_RAW/Dockerfile" -o "$INSTALL_DIR/Dockerfile"
+        curl -fsSL "$GITHUB_RAW/claude-sandbox" -o "$INSTALL_DIR/claude-sandbox"
+        curl -fsSL "$GITHUB_RAW/entrypoint.sh" -o "$INSTALL_DIR/entrypoint.sh"
+        curl -fsSL "$GITHUB_RAW/auto-git.sh" -o "$INSTALL_DIR/auto-git.sh"
+        curl -fsSL "$GITHUB_RAW/p10k.zsh" -o "$INSTALL_DIR/p10k.zsh"
+        curl -fsSL "$GITHUB_RAW/sandbox-context.md" -o "$INSTALL_DIR/sandbox-context.md"
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Downloaded files from GitHub"
+    else
+        # Copy files from local directory
+        cp "$SCRIPT_DIR/Dockerfile" "$INSTALL_DIR/"
+        cp "$SCRIPT_DIR/claude-sandbox" "$INSTALL_DIR/"
+        cp "$SCRIPT_DIR/entrypoint.sh" "$INSTALL_DIR/"
+        cp "$SCRIPT_DIR/auto-git.sh" "$INSTALL_DIR/"
+        cp "$SCRIPT_DIR/p10k.zsh" "$INSTALL_DIR/"
+        cp "$SCRIPT_DIR/sandbox-context.md" "$INSTALL_DIR/"
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Copied files to ${INSTALL_DIR}"
+    fi
 
     # Make executable
     chmod +x "$INSTALL_DIR/claude-sandbox"
     chmod +x "$INSTALL_DIR/entrypoint.sh"
     chmod +x "$INSTALL_DIR/auto-git.sh"
-
-    echo -e "  ${C_SUCCESS}${CHECK}${NC} Copied files to ${INSTALL_DIR}"
 fi
 
 # Create symlink to binary
