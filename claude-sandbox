@@ -571,6 +571,7 @@ launch_sandbox() {
     docker run --rm -it --init \
         --network host \
         -e "TERM=${TERM:-xterm-256color}" \
+        -e "CLAUDE_SANDBOX=1" \
         -v "$HOME/.claude:/home/node/.claude" \
         -v "$HOME/.ssh:/home/node/.ssh-host:ro" \
         -e "GIT_USER_NAME=$git_name" \

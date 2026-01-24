@@ -361,6 +361,7 @@ else
     cp "$SCRIPT_DIR/entrypoint.sh" "$INSTALL_DIR/"
     cp "$SCRIPT_DIR/auto-git.sh" "$INSTALL_DIR/"
     cp "$SCRIPT_DIR/p10k.zsh" "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/sandbox-context.md" "$INSTALL_DIR/"
 
     # Make executable
     chmod +x "$INSTALL_DIR/claude-sandbox"

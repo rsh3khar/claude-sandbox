@@ -73,10 +73,11 @@ ENV PATH="/home/node/.local/bin:$PATH"
 RUN mkdir -p /home/node/workspace
 WORKDIR /home/node/workspace
 
-# Copy scripts (need root for this)
+# Copy scripts and templates (need root for this)
 USER root
 COPY auto-git.sh /usr/local/bin/auto-git
 COPY entrypoint.sh /entrypoint.sh
+COPY sandbox-context.md /usr/local/share/sandbox-context.md
 RUN chmod +x /usr/local/bin/auto-git /entrypoint.sh
 
 # Switch back to node user

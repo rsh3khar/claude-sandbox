@@ -49,44 +49,30 @@ cd ~/workspace/"$REPO_NAME"
 [[ -n "${GIT_USER_NAME:-}" ]] && git config user.name "$GIT_USER_NAME"
 [[ -n "${GIT_USER_EMAIL:-}" ]] && git config user.email "$GIT_USER_EMAIL"
 
-# Create sandbox context file (gitignored)
-if ! grep -q "^\.claude-sandbox$" .gitignore 2>/dev/null; then
-    echo ".claude-sandbox" >> .gitignore
+# Set up CLAUDE.md with sandbox context
+SANDBOX_TEMPLATE="/usr/local/share/sandbox-context.md"
+SANDBOX_MARKER="<!-- END SANDBOX CONTEXT -->"
+
+if [[ -f "CLAUDE.md" ]]; then
+    # Repo has existing CLAUDE.md - prepend sandbox context if not already there
+    if ! grep -q "$SANDBOX_MARKER" CLAUDE.md 2>/dev/null; then
+        # Save original
+        cp CLAUDE.md CLAUDE.md.original
+        # Prepend sandbox context
+        cat "$SANDBOX_TEMPLATE" CLAUDE.md.original > CLAUDE.md
+        rm CLAUDE.md.original
+        echo -e "${C_DIM}Added sandbox context to CLAUDE.md${NC}"
+    fi
+else
+    # No CLAUDE.md - create one from template
+    cp "$SANDBOX_TEMPLATE" CLAUDE.md
+    echo -e "${C_DIM}Created CLAUDE.md with sandbox context${NC}"
 fi
 
-cat > .claude-sandbox << 'SANDBOXEOF'
-# Claude Sandbox Context
-
-You are running inside **Claude Sandbox** - an isolated Docker container.
-
-## Key Facts
-- You have `--dangerously-skip-permissions` enabled (no approval prompts)
-- Changes auto-commit to GitHub every 60 seconds
-- Container is destroyed on exit - your host machine is safe
-- Network is shared with host (all ports work)
-
-## What You Can Do
-- Run any command without asking for permission
-- Install packages, run builds, start servers
-- Make breaking changes - the sandbox is disposable
-
-## Paths
-- Repo: ~/workspace/<repo-name>
-- Shared config: ~/.claude (mounted from host)
-
-## Screenshots / Images
-Clipboard doesn't bridge host ↔ container. When user mentions a screenshot or image:
-1. Check `/home/node/.claude/screenshots/` for the **most recently modified file**
-2. Use `ls -t ~/.claude/screenshots/ | head -1` to find the latest
-3. Read and analyze that image
-
-User saves from host: `shot` (alias) or `pngpaste ~/.claude/screenshots/$(date +%s).png`
-
-## Auto-Save
-- Changes commit every 60s (when changes exist)
-- On exit: final commit "wip: session end"
-- Logs: `/tmp/auto-git.log`
-SANDBOXEOF
+# Gitignore the sandbox additions marker (so git diff is clean)
+if ! grep -q "^CLAUDE.md.original$" .gitignore 2>/dev/null; then
+    echo "CLAUDE.md.original" >> .gitignore
+fi
 
 # Function to show branch menu
 show_branch_menu() {
