@@ -505,10 +505,38 @@ if [[ "$MODE" == "link" ]]; then
     echo ""
 fi
 
-echo -e "  ${C_DIM}Run ${C_ACCENT}claude-sandbox${C_DIM} or ${C_ACCENT}cs${C_DIM} to start${NC}"
+echo -e "  ${C_DIM}Run ${C_ACCENT}claude-sandbox${C_DIM} to start${NC}"
 echo ""
-echo -e "  ${C_DIM}Tip: Add an alias to your shell config:${NC}"
-echo -e "    ${C_TEXT}alias cs=\"claude-sandbox\"${NC}"
+
+# Offer to add cs alias
+SHELL_RC=""
+if [[ -f "$HOME/.zshrc" ]]; then
+    SHELL_RC="$HOME/.zshrc"
+elif [[ -f "$HOME/.bashrc" ]]; then
+    SHELL_RC="$HOME/.bashrc"
+fi
+
+if [[ -n "$SHELL_RC" ]]; then
+    # Check if alias already exists
+    if grep -q 'alias cs=' "$SHELL_RC" 2>/dev/null; then
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Alias ${C_ACCENT}cs${C_DIM} already in $(basename "$SHELL_RC")${NC}"
+    else
+        echo -e "  ${C_DIM}Add ${C_ACCENT}cs${C_DIM} shortcut to $(basename "$SHELL_RC")?${NC}"
+        read -p "  Add alias? [Y/n] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            echo "" >> "$SHELL_RC"
+            echo "# Claude Sandbox" >> "$SHELL_RC"
+            echo 'alias cs="claude-sandbox"' >> "$SHELL_RC"
+            echo -e "  ${C_SUCCESS}${CHECK}${NC} Added ${C_ACCENT}cs${C_DIM} alias (restart terminal or run ${C_TEXT}source $(basename "$SHELL_RC")${C_DIM})${NC}"
+        else
+            echo -e "  ${C_DIM}Skipped. You can add manually: ${C_TEXT}alias cs=\"claude-sandbox\"${NC}"
+        fi
+    fi
+else
+    echo -e "  ${C_DIM}Tip: Add an alias to your shell config:${NC}"
+    echo -e "    ${C_TEXT}alias cs=\"claude-sandbox\"${NC}"
+fi
 echo ""
 echo -e "${C_SUCCESS}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
