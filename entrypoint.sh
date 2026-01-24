@@ -37,10 +37,13 @@ SSHEOF
 chmod 700 ~/.ssh
 chmod 600 ~/.ssh/* 2>/dev/null || true
 
+# Extract repo name from URL
+REPO_NAME=$(basename "$GIT_URL" .git)
+
 # Clone
-echo -e "${C_DIM}Cloning repository...${NC}"
-git clone --quiet "$GIT_URL" ~/workspace/repo
-cd ~/workspace/repo
+echo -e "${C_DIM}Cloning ${REPO_NAME}...${NC}"
+git clone --quiet "$GIT_URL" ~/workspace/"$REPO_NAME"
+cd ~/workspace/"$REPO_NAME"
 
 # Configure git identity
 [[ -n "${GIT_USER_NAME:-}" ]] && git config user.name "$GIT_USER_NAME"
@@ -207,7 +210,7 @@ echo ""
 cleanup() {
     echo ""
     echo -e "${C_DIM}Shutting down...${NC}"
-    cd ~/workspace/repo 2>/dev/null || exit 0
+    cd ~/workspace/"$REPO_NAME" 2>/dev/null || exit 0
     if [[ -n $(git status --porcelain 2>/dev/null) ]]; then
         echo -e "${C_DIM}Saving final changes...${NC}"
         git add -A
@@ -218,12 +221,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Start auto-git
-auto-git 60 > /tmp/auto-git.log 2>&1 &
+# Start auto-git with repo path
+auto-git 60 ~/workspace/"$REPO_NAME" > /tmp/auto-git.log 2>&1 &
 disown $!
 
 echo -e "${C_DIM}─────────────────────────────────────────${NC}"
 echo ""
+echo -e "  ${C_TEXT}Repo:${NC}       ${C_ACCENT}${REPO_NAME}${NC}"
 echo -e "  ${C_TEXT}Branch:${NC}     ${C_ACCENT}$(git branch --show-current)${NC}"
 echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (when changes exist)${NC}"
 echo ""

@@ -1,10 +1,11 @@
 #!/bin/bash
 # Auto-git: Commits and pushes every N seconds ONLY if there are changes
-# Usage: auto-git [interval_seconds]
+# Usage: auto-git [interval_seconds] [repo_path]
 
 INTERVAL=${1:-60}
+REPO_PATH=${2:-~/workspace/repo}
 
-cd ~/workspace/repo || exit 1
+cd "$REPO_PATH" || exit 1
 
 echo "[auto-git] Watching for changes every ${INTERVAL}s"
 echo "[auto-git] Branch: $(git branch --show-current)"
