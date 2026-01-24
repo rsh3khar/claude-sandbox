@@ -74,31 +74,6 @@ cd ~/workspace/"$REPO_NAME"
 [[ -n "${GIT_USER_NAME:-}" ]] && git config user.name "$GIT_USER_NAME"
 [[ -n "${GIT_USER_EMAIL:-}" ]] && git config user.email "$GIT_USER_EMAIL"
 
-# Set up CLAUDE.md with sandbox context
-SANDBOX_TEMPLATE="/usr/local/share/sandbox-context.md"
-SANDBOX_MARKER="<!-- END SANDBOX CONTEXT -->"
-
-HAD_CLAUDE_MD=false
-if [[ -f "CLAUDE.md" ]]; then
-    HAD_CLAUDE_MD=true
-    # Repo has existing CLAUDE.md - prepend sandbox context if not already there
-    if ! grep -q "$SANDBOX_MARKER" CLAUDE.md 2>/dev/null; then
-        # Save original (keep it for restoration)
-        cp CLAUDE.md CLAUDE.md.original
-        # Prepend sandbox context
-        cat "$SANDBOX_TEMPLATE" CLAUDE.md.original > CLAUDE.md
-        echo -e "${C_DIM}Added sandbox context to CLAUDE.md${NC}"
-    fi
-else
-    # No CLAUDE.md - create one from template (will be gitignored)
-    cp "$SANDBOX_TEMPLATE" CLAUDE.md
-    echo -e "${C_DIM}Created CLAUDE.md with sandbox context${NC}"
-fi
-export HAD_CLAUDE_MD
-
-# Note: We don't modify .gitignore - instead we exclude CLAUDE.md from all commits
-# via 'git add -A -- :!CLAUDE.md' in auto-git.sh and cleanup()
-
 # Function to show branch menu
 show_branch_menu() {
     CURRENT=$(git branch --show-current)
@@ -255,6 +230,25 @@ show_branch_menu() {
 show_branch_menu
 
 echo ""
+
+# Set up CLAUDE.md with sandbox context (AFTER branch selection to avoid checkout conflicts)
+SANDBOX_TEMPLATE="/usr/local/share/sandbox-context.md"
+SANDBOX_MARKER="<!-- END SANDBOX CONTEXT -->"
+
+HAD_CLAUDE_MD=false
+if [[ -f "CLAUDE.md" ]]; then
+    HAD_CLAUDE_MD=true
+    # Repo has existing CLAUDE.md - prepend sandbox context if not already there
+    if ! grep -q "$SANDBOX_MARKER" CLAUDE.md 2>/dev/null; then
+        cp CLAUDE.md CLAUDE.md.original
+        cat "$SANDBOX_TEMPLATE" CLAUDE.md.original > CLAUDE.md
+        echo -e "${C_DIM}Added sandbox context to CLAUDE.md${NC}"
+    fi
+else
+    cp "$SANDBOX_TEMPLATE" CLAUDE.md
+    echo -e "${C_DIM}Created CLAUDE.md with sandbox context${NC}"
+fi
+export HAD_CLAUDE_MD
 
 # Cleanup trap
 cleanup() {
