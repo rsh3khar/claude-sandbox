@@ -257,6 +257,7 @@ echo -e "  ${C_TEXT}Branch:${NC}     ${C_ACCENT}$(git branch --show-current)${NC
 echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (when changes exist)${NC}"
 echo ""
 echo -e "  ${C_DIM}Type ${C_TEXT}claude${C_DIM} to start Claude Code${NC}"
+echo -e "  ${C_DIM}Screenshots: save to ${C_TEXT}~/.claude/screenshots/${C_DIM} on host${NC}"
 echo ""
 echo -e "${C_DIM}─────────────────────────────────────────${NC}"
 echo ""
