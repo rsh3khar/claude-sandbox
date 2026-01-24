@@ -53,25 +53,33 @@ cd ~/workspace/"$REPO_NAME"
 SANDBOX_TEMPLATE="/usr/local/share/sandbox-context.md"
 SANDBOX_MARKER="<!-- END SANDBOX CONTEXT -->"
 
+HAD_CLAUDE_MD=false
 if [[ -f "CLAUDE.md" ]]; then
+    HAD_CLAUDE_MD=true
     # Repo has existing CLAUDE.md - prepend sandbox context if not already there
     if ! grep -q "$SANDBOX_MARKER" CLAUDE.md 2>/dev/null; then
-        # Save original
+        # Save original (keep it for restoration)
         cp CLAUDE.md CLAUDE.md.original
         # Prepend sandbox context
         cat "$SANDBOX_TEMPLATE" CLAUDE.md.original > CLAUDE.md
-        rm CLAUDE.md.original
         echo -e "${C_DIM}Added sandbox context to CLAUDE.md${NC}"
     fi
 else
-    # No CLAUDE.md - create one from template
+    # No CLAUDE.md - create one from template (will be gitignored)
     cp "$SANDBOX_TEMPLATE" CLAUDE.md
     echo -e "${C_DIM}Created CLAUDE.md with sandbox context${NC}"
 fi
+export HAD_CLAUDE_MD
 
-# Gitignore the sandbox additions marker (so git diff is clean)
+# Gitignore sandbox files
 if ! grep -q "^CLAUDE.md.original$" .gitignore 2>/dev/null; then
     echo "CLAUDE.md.original" >> .gitignore
+fi
+# If we created CLAUDE.md (repo didn't have one), gitignore it too
+if [[ "$HAD_CLAUDE_MD" == false ]]; then
+    if ! grep -q "^CLAUDE.md$" .gitignore 2>/dev/null; then
+        echo "CLAUDE.md" >> .gitignore
+    fi
 fi
 
 # Function to show branch menu
@@ -236,9 +244,11 @@ cleanup() {
     echo ""
     echo -e "${C_DIM}Shutting down...${NC}"
     cd ~/workspace/"$REPO_NAME" 2>/dev/null || exit 0
-    if [[ -n $(git status --porcelain 2>/dev/null) ]]; then
+
+    # Check for changes (excluding CLAUDE.md which has sandbox context)
+    if [[ -n $(git status --porcelain -- ':!CLAUDE.md' 2>/dev/null) ]]; then
         echo -e "${C_DIM}Saving final changes...${NC}"
-        git add -A
+        git add -A -- ':!CLAUDE.md'
         git commit -m "wip: session end" --no-verify 2>/dev/null || true
         git push 2>/dev/null || true
     fi
