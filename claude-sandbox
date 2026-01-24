@@ -1,0 +1,825 @@
+#!/bin/bash
+set -euo pipefail
+
+###############################################################################
+#  ╔═══════════════════════════════════════════════════════════════════════╗
+#  ║                     CLAUDE SANDBOX                                     ║
+#  ║          Isolated Claude Code with auto-save to GitHub                 ║
+#  ╚═══════════════════════════════════════════════════════════════════════╝
+###############################################################################
+
+# Ensure terminal is restored on exit
+cleanup_terminal() {
+    tput cnorm 2>/dev/null || true  # Show cursor
+    stty echo 2>/dev/null || true   # Enable echo
+}
+trap cleanup_terminal EXIT INT TERM
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Design System                                                           │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+# Colors - Warm dark theme with amber accent (warm dark theme)
+readonly C_BG=$'\033[48;2;28;25;23m'        # Dark warm background
+readonly C_SURFACE=$'\033[48;2;41;37;33m'   # Elevated surface
+readonly C_BORDER=$'\033[38;2;68;64;60m'    # Subtle borders
+readonly C_DIM=$'\033[38;2;120;113;108m'    # Muted text
+readonly C_TEXT=$'\033[38;2;214;211;209m'   # Primary text
+readonly C_BRIGHT=$'\033[38;2;250;250;249m' # Bright text
+readonly C_ACCENT=$'\033[38;2;217;119;6m'   # Amber accent
+readonly C_SUCCESS=$'\033[38;2;34;197;94m'  # Green
+readonly C_ERROR=$'\033[38;2;239;68;68m'    # Red
+readonly C_WARN=$'\033[38;2;234;179;8m'     # Yellow
+readonly C_BLUE=$'\033[38;2;96;165;250m'    # Info blue
+readonly NC=$'\033[0m'
+readonly BOLD=$'\033[1m'
+readonly DIM=$'\033[2m'
+
+# Box drawing characters
+readonly TL="╭" TR="╮" BL="╰" BR="╯" H="─" V="│"
+readonly BULLET="◆" DOT="●" RING="○" CHECK="✓" CROSS="✗" ARROW="→"
+
+# State
+SELECTED_REPO=""
+SELECTED_REPO_URL=""
+GH_USER=""
+GH_USER_DATA=""
+
+IMAGE_NAME="claude-sandbox"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
+
+# Gum styling via environment variables (amber theme)
+export GUM_CHOOSE_CURSOR="▸ "
+export GUM_CHOOSE_CURSOR_FOREGROUND="214"
+export GUM_CHOOSE_ITEM_FOREGROUND="250"
+export GUM_CHOOSE_SELECTED_FOREGROUND="214"
+export GUM_CHOOSE_HEADER_FOREGROUND="243"
+export GUM_FILTER_PROMPT="▸ "
+export GUM_FILTER_PROMPT_FOREGROUND="214"
+export GUM_FILTER_CURSOR_FOREGROUND="214"
+export GUM_FILTER_MATCH_FOREGROUND="214"
+export GUM_FILTER_INDICATOR_FOREGROUND="214"
+export GUM_FILTER_PLACEHOLDER_FOREGROUND="243"
+export GUM_INPUT_PROMPT="▸ "
+export GUM_INPUT_PROMPT_FOREGROUND="214"
+export GUM_INPUT_CURSOR_FOREGROUND="214"
+export GUM_INPUT_PLACEHOLDER_FOREGROUND="243"
+export GUM_CONFIRM_PROMPT_FOREGROUND="214"
+export GUM_CONFIRM_SELECTED_BACKGROUND="214"
+export GUM_CONFIRM_SELECTED_FOREGROUND="0"
+export GUM_CONFIRM_UNSELECTED_FOREGROUND="243"
+export GUM_SPIN_SPINNER_FOREGROUND="214"
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Drawing Primitives                                                      │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+# Draw a box with title
+draw_box() {
+    local width=$1 title="${2:-}" padding="${3:-1}"
+    local inner=$((width - 2))
+
+    # Top border with optional title
+    if [[ -n "$title" ]]; then
+        local title_len=${#title}
+        local left_pad=$(( (inner - title_len - 2) / 2 ))
+        local right_pad=$(( inner - title_len - 2 - left_pad ))
+        echo -e "${C_BORDER}${TL}$(printf '%*s' "$left_pad" '' | tr ' ' "$H") ${C_ACCENT}${title}${C_BORDER} $(printf '%*s' "$right_pad" '' | tr ' ' "$H")${TR}${NC}"
+    else
+        echo -e "${C_BORDER}${TL}$(printf '%*s' "$inner" '' | tr ' ' "$H")${TR}${NC}"
+    fi
+}
+
+draw_box_bottom() {
+    local width=$1
+    local inner=$((width - 2))
+    echo -e "${C_BORDER}${BL}$(printf '%*s' "$inner" '' | tr ' ' "$H")${BR}${NC}"
+}
+
+draw_box_row() {
+    local width=$1 content="$2"
+    local inner=$((width - 4))
+    # Strip ANSI codes and count visible characters properly
+    local stripped=$(echo -e "$content" | sed $'s/\x1b\\[[0-9;]*m//g')
+    local text_len=${#stripped}
+    local padding=$((inner - text_len))
+    [[ $padding -lt 0 ]] && padding=0
+
+    echo -e "${C_BORDER}${V}${NC} ${content}$(printf '%*s' "$padding" '') ${C_BORDER}${V}${NC}"
+}
+
+draw_spacer() {
+    local width=$1
+    local inner=$((width - 4))
+    echo -e "${C_BORDER}${V}${NC}$(printf '%*s' "$((inner + 2))" '')${C_BORDER}${V}${NC}"
+}
+
+draw_separator() {
+    local width=$1
+    local inner=$((width - 2))
+    echo -e "${C_BORDER}├$(printf '%*s' "$inner" '' | tr ' ' '─')┤${NC}"
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Logo & Branding                                                         │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+draw_logo() {
+    local w=60
+    echo ""
+    echo -e "${C_ACCENT}    ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗${NC}"
+    echo -e "${C_ACCENT}   ██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝${NC}"
+    echo -e "${C_ACCENT}   ██║     ██║     ███████║██║   ██║██║  ██║█████╗  ${NC}"
+    echo -e "${C_ACCENT}   ██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  ${NC}"
+    echo -e "${C_ACCENT}   ╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗${NC}"
+    echo -e "${C_ACCENT}    ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝${NC}"
+    echo ""
+    echo -e "${C_DIM}              ┌────────────────────────┐${NC}"
+    echo -e "${C_DIM}              │${NC}   ${C_TEXT}${BOLD}S A N D B O X${NC}${C_DIM}        │${NC}"
+    echo -e "${C_DIM}              └────────────────────────┘${NC}"
+    echo ""
+    echo -e "${C_DIM}     Run Claude Code with ${C_ACCENT}--dangerously-skip-permissions${NC}"
+    echo -e "${C_DIM}          safely in an isolated container${NC}"
+    echo ""
+}
+
+draw_mini_logo() {
+    echo -e "${C_ACCENT}${BOLD}◈ CLAUDE SANDBOX${NC}"
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Status Indicators                                                       │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+status_dot() {
+    local status="$1"
+    case "$status" in
+        "ok")      echo -e "${C_SUCCESS}${DOT}${NC}" ;;
+        "warn")    echo -e "${C_WARN}${DOT}${NC}" ;;
+        "error")   echo -e "${C_ERROR}${DOT}${NC}" ;;
+        "pending") echo -e "${C_DIM}${RING}${NC}" ;;
+        *)         echo -e "${C_DIM}${DOT}${NC}" ;;
+    esac
+}
+
+animate_spinner() {
+    local pid=$1
+    local msg="${2:-Loading}"
+    local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+    local i=0
+
+    # Ensure cursor is restored on exit
+    trap 'tput cnorm 2>/dev/null' RETURN
+
+    tput civis 2>/dev/null || true  # Hide cursor
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r  ${C_ACCENT}${frames[$i]}${NC} ${C_DIM}${msg}${NC}  "
+        i=$(( (i + 1) % ${#frames[@]} ))
+        sleep 0.08
+    done
+    printf "\r%50s\r" ""  # Clear line
+    tput cnorm 2>/dev/null || true  # Show cursor
+}
+
+progress_bar() {
+    local current=$1 total=$2 width=${3:-30}
+    local pct=$((current * 100 / total))
+    local filled=$((current * width / total))
+    local empty=$((width - filled))
+
+    printf "${C_ACCENT}"
+    printf '%*s' "$filled" '' | tr ' ' '█'
+    printf "${C_DIM}"
+    printf '%*s' "$empty" '' | tr ' ' '░'
+    printf "${NC} ${C_TEXT}%3d%%${NC}" "$pct"
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ GitHub Integration                                                      │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+refresh_gh_user() {
+    if gh auth status &>/dev/null; then
+        GH_USER=$(gh api user --jq '.login' 2>/dev/null || echo "")
+        if [[ -n "$GH_USER" ]]; then
+            GH_USER_DATA=$(gh api user 2>/dev/null || echo "")
+        fi
+    else
+        GH_USER=""
+        GH_USER_DATA=""
+    fi
+}
+
+get_all_accounts() {
+    gh auth status 2>&1 | grep -o 'account [^ ]*' | awk '{print $2}' || true
+}
+
+draw_contribution_graph() {
+    local username="$1"
+
+    local query='query($username: String!) {
+        user(login: $username) {
+            contributionsCollection {
+                contributionCalendar {
+                    totalContributions
+                    weeks {
+                        contributionDays {
+                            contributionCount
+                            date
+                        }
+                    }
+                }
+            }
+        }
+    }'
+
+    local data
+    data=$(gh api graphql -f query="$query" -f username="$username" 2>/dev/null || echo "")
+
+    if [[ -z "$data" ]]; then
+        return
+    fi
+
+    local total
+    total=$(echo "$data" | jq -r '.data.user.contributionsCollection.contributionCalendar.totalContributions // 0')
+
+    # Get last 26 weeks
+    local weeks
+    weeks=$(echo "$data" | jq -r '.data.user.contributionsCollection.contributionCalendar.weeks[-26:]')
+
+    # Build contribution map
+    local graph_lines=("" "" "" "" "" "" "")
+
+    for week_idx in $(seq 0 25); do
+        for day_idx in $(seq 0 6); do
+            local count
+            count=$(echo "$weeks" | jq -r ".[$week_idx].contributionDays[$day_idx].contributionCount // 0" 2>/dev/null || echo "0")
+
+            local block
+            if [[ "$count" -eq 0 ]]; then
+                block="${C_DIM}░${NC}"
+            elif [[ "$count" -le 3 ]]; then
+                block="\033[38;2;22;101;52m▒${NC}"
+            elif [[ "$count" -le 6 ]]; then
+                block="\033[38;2;34;139;34m▓${NC}"
+            else
+                block="\033[38;2;0;200;83m█${NC}"
+            fi
+
+            graph_lines[$day_idx]+="$block"
+        done
+    done
+
+    echo ""
+    echo -e "  ${C_DIM}${total} contributions this year${NC}"
+    echo ""
+    echo -e "  ${C_DIM}M${NC} ${graph_lines[1]}"
+    echo -e "  ${C_DIM}W${NC} ${graph_lines[3]}"
+    echo -e "  ${C_DIM}F${NC} ${graph_lines[5]}"
+    echo ""
+    echo -e "  ${C_DIM}░${NC}${C_DIM} none${NC}  \033[38;2;22;101;52m▒${NC}${C_DIM} low${NC}  \033[38;2;34;139;34m▓${NC}${C_DIM} med${NC}  \033[38;2;0;200;83m█${NC}${C_DIM} high${NC}"
+}
+
+draw_user_card() {
+    local username="$1"
+    local w=56
+
+    if [[ -z "$GH_USER_DATA" ]]; then
+        return
+    fi
+
+    local name followers repos
+    name=$(echo "$GH_USER_DATA" | jq -r '.name // .login')
+    followers=$(echo "$GH_USER_DATA" | jq -r '.followers // 0')
+    repos=$(echo "$GH_USER_DATA" | jq -r '.public_repos // 0')
+
+    echo ""
+    draw_box $w "GITHUB"
+    draw_spacer $w
+    draw_box_row $w "${C_BRIGHT}${BOLD}  ◉ ${name}${NC}"
+    draw_box_row $w "${C_DIM}    @${username}${NC}"
+    draw_spacer $w
+    draw_box_row $w "${C_DIM}  ${BULLET} ${repos} repos   ${BULLET} ${followers} followers${NC}"
+    draw_box_bottom $w
+
+    draw_contribution_graph "$username"
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Screens                                                                 │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+screen_welcome() {
+    clear
+    draw_logo
+
+    gum spin --spinner dot --title "Connecting to GitHub..." -- bash -c 'sleep 0.5'
+    refresh_gh_user
+
+    if [[ -z "$GH_USER" ]]; then
+        echo ""
+        echo -e "  ${C_WARN}${BULLET}${NC} ${C_TEXT}No GitHub account found${NC}"
+        echo ""
+        echo -e "  ${C_DIM}Run ${C_TEXT}gh auth login${C_DIM} first${NC}"
+        echo ""
+        exit 1
+    fi
+
+    draw_user_card "$GH_USER"
+
+    echo ""
+    echo -e "  ${C_DIM}Press ${C_TEXT}Enter${C_DIM} to continue...${NC}"
+    read -r
+}
+
+screen_repo_select() {
+    local w=56
+
+    clear
+    echo ""
+    draw_mini_logo
+    echo ""
+
+    draw_box $w "SELECT REPOSITORY"
+    draw_spacer $w
+    draw_box_row $w "${C_ACCENT}${ARROW}${NC} ${C_TEXT}Search my repositories${NC}"
+    draw_box_row $w "${C_DIM}  Type to filter from your GitHub repos${NC}"
+    draw_spacer $w
+    draw_separator $w
+    draw_spacer $w
+    draw_box_row $w "${C_ACCENT}${ARROW}${NC} ${C_TEXT}Enter repository name${NC}"
+    draw_box_row $w "${C_DIM}  Format: owner/repo or just repo${NC}"
+    draw_spacer $w
+    draw_separator $w
+    draw_spacer $w
+    draw_box_row $w "${C_ACCENT}${ARROW}${NC} ${C_TEXT}Paste git URL${NC}"
+    draw_box_row $w "${C_DIM}  SSH or HTTPS clone URL${NC}"
+    draw_spacer $w
+    draw_box_bottom $w
+    echo ""
+
+    local choice
+    choice=$(gum choose --height=6 \
+        "Search my repos" "Enter repo name" "Paste URL" "← Back")
+
+    case "$choice" in
+        "Search my repos")
+            echo ""
+
+            local repos
+            repos=$(gum spin --spinner dot --title "Loading repositories..." --show-output -- \
+                gh repo list --limit 100 --json nameWithOwner --jq '.[].nameWithOwner' 2>/dev/null)
+
+            if [[ -z "$repos" ]]; then
+                echo -e "  ${C_ERROR}${CROSS}${NC} No repositories found"
+                sleep 1
+                return
+            fi
+
+            echo ""
+            local selected
+            selected=$(echo "$repos" | gum filter --placeholder="Search repos..." --height=12)
+
+            if [[ -n "$selected" ]]; then
+                confirm_repo "$selected"
+            fi
+            ;;
+
+        "Enter repo name")
+            echo ""
+            local name
+            name=$(gum input --placeholder="owner/repo")
+
+            if [[ -n "$name" ]]; then
+                echo ""
+                local url
+                url=$(gum spin --spinner dot --title "Looking up ${name}..." --show-output -- \
+                    gh repo view "$name" --json sshUrl --jq '.sshUrl' 2>/dev/null || echo "")
+
+                if [[ -n "$url" ]]; then
+                    confirm_repo "$name"
+                else
+                    echo -e "  ${C_ERROR}${CROSS}${NC} Repository not found"
+                    sleep 1
+                fi
+            fi
+            ;;
+
+        "Paste URL")
+            echo ""
+            local url
+            url=$(gum input --placeholder="git@github.com:user/repo.git")
+
+            if [[ -n "$url" ]]; then
+                SELECTED_REPO=$(basename "$url" .git)
+                SELECTED_REPO_URL="$url"
+            fi
+            ;;
+    esac
+}
+
+confirm_repo() {
+    local repo="$1"
+    local w=56
+
+    clear
+    echo ""
+    draw_mini_logo
+    echo ""
+
+    # Fetch repo details
+    local info
+    info=$(gh repo view "$repo" --json name,owner,description,stargazerCount,forkCount,primaryLanguage,pushedAt 2>/dev/null || echo "")
+
+    if [[ -z "$info" ]]; then
+        echo -e "  ${C_ERROR}${CROSS}${NC} Could not fetch repository info"
+        sleep 1
+        return
+    fi
+
+    local name owner desc stars forks lang pushed
+    name=$(echo "$info" | jq -r '.name // ""')
+    owner=$(echo "$info" | jq -r '.owner.login // ""')
+    desc=$(echo "$info" | jq -r '.description // ""' | head -c 45)
+    stars=$(echo "$info" | jq -r '.stargazerCount // 0')
+    forks=$(echo "$info" | jq -r '.forkCount // 0')
+    lang=$(echo "$info" | jq -r '.primaryLanguage.name // "—"')
+    pushed=$(echo "$info" | jq -r '.pushedAt // ""')
+
+    if [[ -n "$pushed" ]]; then
+        pushed=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$pushed" "+%b %d" 2>/dev/null || echo "")
+    fi
+
+    draw_box $w "REPOSITORY"
+    draw_spacer $w
+    draw_box_row $w "${C_BRIGHT}${BOLD}  ${owner}/${name}${NC}"
+    if [[ -n "$desc" ]]; then
+        draw_box_row $w "${C_DIM}  ${desc}${NC}"
+    fi
+    draw_spacer $w
+    draw_separator $w
+    draw_spacer $w
+    draw_box_row $w "  ${C_WARN}★${NC} ${stars}    ${C_DIM}⑂${NC} ${forks}    ${C_BLUE}◆${NC} ${lang}    ${C_DIM}⟳${NC} ${pushed}"
+    draw_spacer $w
+    draw_box_bottom $w
+
+    echo ""
+
+    if gum confirm "Use this repository?"; then
+        SELECTED_REPO="$repo"
+        SELECTED_REPO_URL=$(gh repo view "$repo" --json sshUrl --jq '.sshUrl' 2>/dev/null)
+    fi
+}
+
+screen_launch_confirm() {
+    local w=56
+
+    clear
+    echo ""
+    draw_mini_logo
+    echo ""
+
+    draw_box $w "LAUNCH SANDBOX"
+    draw_spacer $w
+    draw_box_row $w "  ${C_DIM}Repository${NC}    ${C_BRIGHT}${SELECTED_REPO}${NC}"
+    draw_box_row $w "  ${C_DIM}Account${NC}       ${C_ACCENT}@${GH_USER}${NC}"
+    draw_box_row $w "  ${C_DIM}Network${NC}       ${C_TEXT}host (all ports accessible)${NC}"
+    draw_spacer $w
+    draw_separator $w
+    draw_spacer $w
+    draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container isolated from filesystem${NC}"
+    draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}SSH keys forwarded (never copied)${NC}"
+    draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every 60s → GitHub${NC}"
+    draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
+    draw_spacer $w
+    draw_box_bottom $w
+
+    echo ""
+    echo -e "  ${C_DIM}Claude Code will run with ${C_ACCENT}--dangerously-skip-permissions${NC}"
+    echo ""
+
+    if ! gum confirm "Launch sandbox?"; then
+        return 1
+    fi
+
+    return 0
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Launch Logic                                                            │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+ensure_image() {
+    if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+        echo ""
+        echo -e "  ${C_ACCENT}${BULLET}${NC} ${C_TEXT}Building sandbox image...${NC}"
+        echo ""
+        docker build -t "$IMAGE_NAME" "$SCRIPT_DIR" 2>&1 | while read -r line; do
+            echo -e "    ${C_DIM}${line}${NC}"
+        done
+        echo ""
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Image ready"
+    fi
+}
+
+launch_sandbox() {
+    clear
+    echo ""
+    draw_mini_logo
+    echo ""
+
+    echo -e "  ${C_ACCENT}▸${NC} Preparing sandbox..."
+    ensure_image
+
+    echo -e "  ${C_ACCENT}▸${NC} Launching container..."
+    echo ""
+
+    # SSH agent forwarding for OrbStack/Docker Desktop
+    local ssh_args=(
+        "-v" "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock"
+        "-e" "SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock"
+    )
+
+    # Git identity from host
+    local git_name git_email
+    git_name=$(git config --global user.name 2>/dev/null || echo "")
+    git_email=$(git config --global user.email 2>/dev/null || echo "")
+
+    # Auth for Claude (read from secure file or env)
+    local auth_args=()
+    local oauth_token="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+
+    # Try reading from secure file if env not set
+    if [[ -z "$oauth_token" && -f "$HOME/.claude-sandbox-token" ]]; then
+        oauth_token=$(cat "$HOME/.claude-sandbox-token" 2>/dev/null | tr -d '\n')
+    fi
+
+    if [[ -n "$oauth_token" ]]; then
+        auth_args+=("-e" "CLAUDE_CODE_OAUTH_TOKEN=$oauth_token")
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Using OAuth token"
+    elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        auth_args+=("-e" "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Using API key"
+    else
+        echo -e "  ${C_WARN}${BULLET}${NC} ${C_DIM}No auth - run 'claude setup-token' and save to ~/.claude-sandbox-token${NC}"
+    fi
+
+    # Run the container
+    # --init for proper signal handling, TERM for terminal features
+    # --network host: all container ports accessible on localhost (simpler than -p)
+    docker run --rm -it --init \
+        --network host \
+        -e "TERM=${TERM:-xterm-256color}" \
+        -v "$HOME/.claude:/home/node/.claude" \
+        -v "$HOME/.ssh:/home/node/.ssh-host:ro" \
+        -e "GIT_USER_NAME=$git_name" \
+        -e "GIT_USER_EMAIL=$git_email" \
+        "${auth_args[@]}" \
+        "${ssh_args[@]}" \
+        "$IMAGE_NAME" \
+        "$SELECTED_REPO_URL"
+
+    # After exit
+    echo ""
+    echo -e "  ${C_SUCCESS}${CHECK}${NC} ${C_TEXT}Container destroyed${NC}"
+    echo -e "  ${C_DIM}  Your changes are safely on GitHub${NC}"
+    echo ""
+    echo -e "  ${C_DIM}Press Enter to continue...${NC}"
+    read -r
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Main Menu                                                               │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+screen_main_menu() {
+    local w=56
+
+    while true; do
+        clear
+        echo ""
+        draw_mini_logo
+        echo ""
+
+        # Status card
+        draw_box $w "STATUS"
+        draw_spacer $w
+
+        if [[ -n "$GH_USER" ]]; then
+            draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}GitHub${NC}        ${C_ACCENT}@${GH_USER}${NC}"
+        else
+            draw_box_row $w "  ${C_ERROR}${DOT}${NC} ${C_DIM}GitHub${NC}        ${C_TEXT}Not connected${NC}"
+        fi
+
+        if [[ -n "$SELECTED_REPO" ]]; then
+            draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Repository${NC}    ${C_TEXT}${SELECTED_REPO}${NC}"
+        else
+            draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Repository${NC}    ${C_DIM}None selected${NC}"
+        fi
+
+        draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Network${NC}       ${C_TEXT}host mode${NC}"
+        draw_spacer $w
+        draw_box_bottom $w
+
+        echo ""
+
+        # Build menu options
+        local options=()
+        if [[ -n "$SELECTED_REPO" && -n "$GH_USER" ]]; then
+            options+=("🚀  Launch Sandbox")
+        fi
+        options+=("📂  Select Repository")
+        options+=("👤  Switch Account")
+        options+=("❌  Exit")
+
+        local choice
+        choice=$(printf '%s\n' "${options[@]}" | gum choose --height=8)
+
+        case "$choice" in
+            "🚀  Launch Sandbox")
+                if screen_launch_confirm; then
+                    launch_sandbox
+                fi
+                ;;
+            "📂  Select Repository")
+                screen_repo_select
+                ;;
+            "👤  Switch Account")
+                screen_switch_account
+                ;;
+            "❌  Exit")
+                clear
+                echo ""
+                echo -e "  ${C_DIM}Goodbye.${NC}"
+                echo ""
+                exit 0
+                ;;
+        esac
+    done
+}
+
+screen_switch_account() {
+    local w=56
+
+    clear
+    echo ""
+    draw_mini_logo
+    echo ""
+
+    local accounts
+    accounts=$(get_all_accounts)
+
+    if [[ -z "$accounts" ]]; then
+        echo -e "  ${C_WARN}${BULLET}${NC} No accounts found"
+        echo ""
+        echo -e "  ${C_DIM}Run ${C_TEXT}gh auth login${C_DIM} to add an account${NC}"
+        echo ""
+        read -r
+        return
+    fi
+
+    draw_box $w "SWITCH ACCOUNT"
+    draw_spacer $w
+    draw_box_row $w "${C_DIM}  Select a GitHub account:${NC}"
+    draw_spacer $w
+    draw_box_bottom $w
+    echo ""
+
+    accounts=$(echo -e "${accounts}\n+ Add new account")
+
+    local selected
+    selected=$(echo "$accounts" | gum choose --height=6)
+
+    if [[ "$selected" == "+ Add new account" ]]; then
+        gh auth login
+    elif [[ -n "$selected" ]]; then
+        gh auth switch --user "$selected" 2>/dev/null || true
+    fi
+
+    refresh_gh_user
+
+    if [[ -n "$GH_USER" ]]; then
+        clear
+        echo ""
+        draw_mini_logo
+        echo ""
+        draw_user_card "$GH_USER"
+        echo ""
+        echo -e "  ${C_DIM}Press Enter to continue...${NC}"
+        read -r
+    fi
+}
+
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Current Directory Detection                                             │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+detect_current_repo() {
+    if ! git rev-parse --git-dir &>/dev/null; then
+        return
+    fi
+
+    local remote_url
+    remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+
+    if [[ -z "$remote_url" ]]; then
+        return
+    fi
+
+    # Extract owner/repo
+    local repo_path
+    if [[ "$remote_url" == git@* ]]; then
+        repo_path=$(echo "$remote_url" | sed 's/.*://' | sed 's/\.git$//')
+    else
+        repo_path=$(echo "$remote_url" | sed -E 's|https?://[^/]+/||' | sed 's/\.git$//')
+    fi
+
+    local w=56
+    clear
+    echo ""
+    draw_mini_logo
+    echo ""
+
+    draw_box $w "CURRENT DIRECTORY"
+    draw_spacer $w
+    draw_box_row $w "${C_DIM}  Detected git repository:${NC}"
+    draw_box_row $w "${C_BRIGHT}  ${repo_path}${NC}"
+    draw_spacer $w
+    draw_box_bottom $w
+    echo ""
+
+    if gum confirm "Use this repository?"; then
+        SELECTED_REPO="$repo_path"
+        SELECTED_REPO_URL="$remote_url"
+    fi
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Dependencies Check                                                      │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+check_deps() {
+    local missing=()
+    command -v docker &>/dev/null || missing+=("docker")
+    command -v gh &>/dev/null || missing+=("gh")
+    command -v gum &>/dev/null || missing+=("gum")
+    command -v jq &>/dev/null || missing+=("jq")
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        clear
+        echo ""
+        draw_logo
+        echo ""
+        echo -e "  ${C_ERROR}${CROSS}${NC} ${C_TEXT}Missing dependencies:${NC}"
+        echo ""
+        for dep in "${missing[@]}"; do
+            echo -e "    ${C_DIM}•${NC} ${dep}"
+        done
+        echo ""
+        echo -e "  ${C_DIM}Install with: ${C_TEXT}brew install ${missing[*]}${NC}"
+        echo ""
+        exit 1
+    fi
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Entry Point                                                             │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+main() {
+    # Direct invocation with args
+    if [[ $# -gt 0 ]]; then
+        check_deps
+        refresh_gh_user
+
+        local input="$1"
+
+        if [[ "$input" == http* || "$input" == git@* ]]; then
+            SELECTED_REPO_URL="$input"
+            SELECTED_REPO=$(basename "$input" .git)
+        else
+            SELECTED_REPO_URL=$(gh repo view "$input" --json sshUrl --jq '.sshUrl' 2>/dev/null || echo "")
+            SELECTED_REPO="$input"
+
+            if [[ -z "$SELECTED_REPO_URL" ]]; then
+                echo -e "  ${C_ERROR}${CROSS}${NC} Repository not found: ${input}"
+                exit 1
+            fi
+        fi
+
+        if screen_launch_confirm; then
+            launch_sandbox
+        fi
+        exit 0
+    fi
+
+    # Interactive mode
+    check_deps
+    screen_welcome
+    detect_current_repo
+    screen_main_menu
+}
+
+main "$@"
