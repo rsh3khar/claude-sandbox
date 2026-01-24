@@ -289,10 +289,12 @@ draw_user_card() {
         return
     fi
 
-    local name followers repos
+    local name followers repos public_repos private_repos
     name=$(echo "$GH_USER_DATA" | jq -r '.name // .login')
     followers=$(echo "$GH_USER_DATA" | jq -r '.followers // 0')
-    repos=$(echo "$GH_USER_DATA" | jq -r '.public_repos // 0')
+    public_repos=$(echo "$GH_USER_DATA" | jq -r '.public_repos // 0')
+    private_repos=$(echo "$GH_USER_DATA" | jq -r '.total_private_repos // 0')
+    repos=$((public_repos + private_repos))
 
     echo ""
     draw_box $w "GITHUB"
