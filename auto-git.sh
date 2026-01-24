@@ -16,13 +16,13 @@ COMMIT_COUNT=0
 while true; do
     sleep "$INTERVAL"
 
-    # Only commit if there are actual changes (excluding CLAUDE.md which has sandbox context)
-    if [[ -n $(git status --porcelain -- ':!CLAUDE.md') ]]; then
+    # Only commit if there are actual changes (excluding sandbox files)
+    if [[ -n $(git status --porcelain -- ':!CLAUDE.md' ':!CLAUDE.md.original') ]]; then
         TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
         COMMIT_COUNT=$((COMMIT_COUNT + 1))
 
-        # Add everything except CLAUDE.md (it has sandbox-injected content)
-        git add -A -- ':!CLAUDE.md'
+        # Add everything except sandbox files
+        git add -A -- ':!CLAUDE.md' ':!CLAUDE.md.original'
 
         if git commit -m "auto-save #${COMMIT_COUNT}: ${TIMESTAMP}" --no-verify 2>/dev/null; then
             if git push 2>/dev/null; then

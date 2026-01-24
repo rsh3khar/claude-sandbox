@@ -71,16 +71,8 @@ else
 fi
 export HAD_CLAUDE_MD
 
-# Gitignore sandbox files
-if ! grep -q "^CLAUDE.md.original$" .gitignore 2>/dev/null; then
-    echo "CLAUDE.md.original" >> .gitignore
-fi
-# If we created CLAUDE.md (repo didn't have one), gitignore it too
-if [[ "$HAD_CLAUDE_MD" == false ]]; then
-    if ! grep -q "^CLAUDE.md$" .gitignore 2>/dev/null; then
-        echo "CLAUDE.md" >> .gitignore
-    fi
-fi
+# Note: We don't modify .gitignore - instead we exclude CLAUDE.md from all commits
+# via 'git add -A -- :!CLAUDE.md' in auto-git.sh and cleanup()
 
 # Function to show branch menu
 show_branch_menu() {
@@ -245,10 +237,10 @@ cleanup() {
     echo -e "${C_DIM}Shutting down...${NC}"
     cd ~/workspace/"$REPO_NAME" 2>/dev/null || exit 0
 
-    # Check for changes (excluding CLAUDE.md which has sandbox context)
-    if [[ -n $(git status --porcelain -- ':!CLAUDE.md' 2>/dev/null) ]]; then
+    # Check for changes (excluding sandbox files)
+    if [[ -n $(git status --porcelain -- ':!CLAUDE.md' ':!CLAUDE.md.original' 2>/dev/null) ]]; then
         echo -e "${C_DIM}Saving final changes...${NC}"
-        git add -A -- ':!CLAUDE.md'
+        git add -A -- ':!CLAUDE.md' ':!CLAUDE.md.original'
         git commit -m "wip: session end" --no-verify 2>/dev/null || true
         git push 2>/dev/null || true
     fi
