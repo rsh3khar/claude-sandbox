@@ -44,6 +44,8 @@ SELECTED_REPO=""
 SELECTED_REPO_URL=""
 GH_USER=""
 GH_USER_DATA=""
+LOCAL_MODE=false
+LOCAL_PATH=""
 
 IMAGE_NAME="claude-sandbox"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -338,6 +340,91 @@ screen_welcome() {
     read -r
 }
 
+screen_source_select() {
+    local w=56
+
+    clear
+    echo ""
+    draw_mini_logo
+    echo ""
+
+    draw_box $w "SELECT SOURCE"
+    draw_spacer $w
+    draw_box_row $w "${C_ACCENT}1)${NC} ${C_TEXT}GitHub repository${NC}"
+    draw_box_row $w "${C_DIM}   Clone and work on a remote repo${NC}"
+    draw_spacer $w
+    draw_separator $w
+    draw_spacer $w
+    draw_box_row $w "${C_ACCENT}2)${NC} ${C_TEXT}Local directory${NC}"
+    draw_box_row $w "${C_DIM}   Work on a local git repo (no push)${NC}"
+    draw_spacer $w
+    draw_box_bottom $w
+    echo ""
+
+    local choice
+    choice=$(gum choose --height=4 "GitHub repository" "Local directory")
+
+    case "$choice" in
+        "GitHub repository")
+            LOCAL_MODE=false
+            ;;
+        "Local directory")
+            LOCAL_MODE=true
+            screen_local_path
+            ;;
+    esac
+}
+
+screen_local_path() {
+    local w=56
+
+    clear
+    echo ""
+    draw_mini_logo
+    echo ""
+
+    draw_box $w "LOCAL REPOSITORY"
+    draw_spacer $w
+    draw_box_row $w "${C_DIM}  Enter path to a git repository${NC}"
+    draw_box_row $w "${C_DIM}  Use ${C_TEXT}.${C_DIM} for current directory${NC}"
+    draw_spacer $w
+    draw_box_bottom $w
+    echo ""
+
+    local path_input
+    path_input=$(gum input --placeholder="." --value=".")
+
+    if [[ -z "$path_input" ]]; then
+        path_input="."
+    fi
+
+    # Expand ~ and resolve to absolute path
+    path_input="${path_input/#\~/$HOME}"
+    LOCAL_PATH=$(cd "$path_input" 2>/dev/null && pwd) || {
+        echo ""
+        echo -e "  ${C_ERROR}${CROSS}${NC} Directory not found: ${path_input}"
+        sleep 2
+        LOCAL_MODE=false
+        return
+    }
+
+    # Check if it's a git repo
+    if [[ ! -d "$LOCAL_PATH/.git" ]]; then
+        echo ""
+        echo -e "  ${C_ERROR}${CROSS}${NC} Not a git repository: ${LOCAL_PATH}"
+        sleep 2
+        LOCAL_MODE=false
+        return
+    fi
+
+    # Get repo name from directory
+    SELECTED_REPO=$(basename "$LOCAL_PATH")
+
+    echo ""
+    echo -e "  ${C_SUCCESS}${CHECK}${NC} Found git repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
+    sleep 1
+}
+
 screen_repo_select() {
     local w=56
 
@@ -485,20 +572,38 @@ screen_launch_confirm() {
     draw_mini_logo
     echo ""
 
-    draw_box $w "LAUNCH SANDBOX"
-    draw_spacer $w
-    draw_box_row $w "  ${C_DIM}Repository${NC}    ${C_BRIGHT}${SELECTED_REPO}${NC}"
-    draw_box_row $w "  ${C_DIM}Account${NC}       ${C_ACCENT}@${GH_USER}${NC}"
-    draw_box_row $w "  ${C_DIM}Network${NC}       ${C_TEXT}host (all ports accessible)${NC}"
-    draw_spacer $w
-    draw_separator $w
-    draw_spacer $w
-    draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container isolated from filesystem${NC}"
-    draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}SSH keys forwarded (never copied)${NC}"
-    draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every 60s → GitHub${NC}"
-    draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
-    draw_spacer $w
-    draw_box_bottom $w
+    if [[ "$LOCAL_MODE" == true ]]; then
+        draw_box $w "LAUNCH SANDBOX (LOCAL)"
+        draw_spacer $w
+        draw_box_row $w "  ${C_DIM}Repository${NC}    ${C_BRIGHT}${SELECTED_REPO}${NC}"
+        draw_box_row $w "  ${C_DIM}Path${NC}          ${C_TEXT}${LOCAL_PATH}${NC}"
+        draw_box_row $w "  ${C_DIM}Network${NC}       ${C_TEXT}host (all ports accessible)${NC}"
+        draw_spacer $w
+        draw_separator $w
+        draw_spacer $w
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container isolated from filesystem${NC}"
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Local repo mounted (changes persist)${NC}"
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every 60s (local only)${NC}"
+        draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}No push to remote${NC}"
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
+        draw_spacer $w
+        draw_box_bottom $w
+    else
+        draw_box $w "LAUNCH SANDBOX"
+        draw_spacer $w
+        draw_box_row $w "  ${C_DIM}Repository${NC}    ${C_BRIGHT}${SELECTED_REPO}${NC}"
+        draw_box_row $w "  ${C_DIM}Account${NC}       ${C_ACCENT}@${GH_USER}${NC}"
+        draw_box_row $w "  ${C_DIM}Network${NC}       ${C_TEXT}host (all ports accessible)${NC}"
+        draw_spacer $w
+        draw_separator $w
+        draw_spacer $w
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container isolated from filesystem${NC}"
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}SSH keys forwarded (never copied)${NC}"
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every 60s → GitHub${NC}"
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
+        draw_spacer $w
+        draw_box_bottom $w
+    fi
 
     echo ""
     echo -e "  ${C_DIM}Claude Code will run with ${C_ACCENT}--dangerously-skip-permissions${NC}"
@@ -570,27 +675,52 @@ launch_sandbox() {
         echo -e "  ${C_WARN}${BULLET}${NC} ${C_DIM}No auth - run 'claude setup-token' and save to ~/.claude-sandbox-token${NC}"
     fi
 
-    # Run the container
-    # --init for proper signal handling, TERM for terminal features
-    # --network host: all container ports accessible on localhost (simpler than -p)
-    docker run --rm -it --init \
-        --network host \
-        -e "TERM=${TERM:-xterm-256color}" \
-        -e "CLAUDE_SANDBOX=1" \
-        -v "$HOME/.claude:/home/node/.claude" \
-        -v "$HOME/.ssh:/home/node/.ssh-host:ro" \
-        -e "GIT_USER_NAME=$git_name" \
-        -e "GIT_USER_EMAIL=$git_email" \
-        "${auth_args[@]}" \
-        "${ssh_args[@]}" \
-        "$IMAGE_NAME" \
-        "$SELECTED_REPO_URL"
+    if [[ "$LOCAL_MODE" == true ]]; then
+        # Local mode: bind mount the repo, pass --local flag
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Local mode: mounting ${LOCAL_PATH}"
 
-    # After exit
-    echo ""
-    echo -e "  ${C_SUCCESS}${CHECK}${NC} ${C_TEXT}Container destroyed${NC}"
-    echo -e "  ${C_DIM}  Your changes are safely on GitHub${NC}"
-    echo ""
+        docker run --rm -it --init \
+            --network host \
+            -e "TERM=${TERM:-xterm-256color}" \
+            -e "CLAUDE_SANDBOX=1" \
+            -e "LOCAL_MODE=1" \
+            -v "$HOME/.claude:/home/node/.claude" \
+            -v "$HOME/.ssh:/home/node/.ssh-host:ro" \
+            -v "$LOCAL_PATH:/home/node/workspace/$SELECTED_REPO" \
+            -e "GIT_USER_NAME=$git_name" \
+            -e "GIT_USER_EMAIL=$git_email" \
+            "${auth_args[@]}" \
+            "${ssh_args[@]}" \
+            "$IMAGE_NAME" \
+            "--local" "$SELECTED_REPO"
+
+        # After exit (local mode)
+        echo ""
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} ${C_TEXT}Container destroyed${NC}"
+        echo -e "  ${C_DIM}  Your changes are on a local branch${NC}"
+        echo ""
+    else
+        # GitHub mode: clone from URL
+        docker run --rm -it --init \
+            --network host \
+            -e "TERM=${TERM:-xterm-256color}" \
+            -e "CLAUDE_SANDBOX=1" \
+            -v "$HOME/.claude:/home/node/.claude" \
+            -v "$HOME/.ssh:/home/node/.ssh-host:ro" \
+            -e "GIT_USER_NAME=$git_name" \
+            -e "GIT_USER_EMAIL=$git_email" \
+            "${auth_args[@]}" \
+            "${ssh_args[@]}" \
+            "$IMAGE_NAME" \
+            "$SELECTED_REPO_URL"
+
+        # After exit (GitHub mode)
+        echo ""
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} ${C_TEXT}Container destroyed${NC}"
+        echo -e "  ${C_DIM}  Your changes are safely on GitHub${NC}"
+        echo ""
+    fi
+
     echo -e "  ${C_DIM}Press Enter to continue...${NC}"
     read -r
 }
@@ -612,16 +742,26 @@ screen_main_menu() {
         draw_box $w "STATUS"
         draw_spacer $w
 
-        if [[ -n "$GH_USER" ]]; then
-            draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}GitHub${NC}        ${C_ACCENT}@${GH_USER}${NC}"
+        if [[ "$LOCAL_MODE" == true ]]; then
+            draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Mode${NC}          ${C_ACCENT}Local${NC}"
+            if [[ -n "$SELECTED_REPO" ]]; then
+                draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Repository${NC}    ${C_TEXT}${SELECTED_REPO}${NC}"
+                draw_box_row $w "  ${C_DIM}  ${NC} ${C_DIM}Path${NC}          ${C_DIM}${LOCAL_PATH}${NC}"
+            else
+                draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Repository${NC}    ${C_DIM}None selected${NC}"
+            fi
         else
-            draw_box_row $w "  ${C_ERROR}${DOT}${NC} ${C_DIM}GitHub${NC}        ${C_TEXT}Not connected${NC}"
-        fi
+            if [[ -n "$GH_USER" ]]; then
+                draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}GitHub${NC}        ${C_ACCENT}@${GH_USER}${NC}"
+            else
+                draw_box_row $w "  ${C_ERROR}${DOT}${NC} ${C_DIM}GitHub${NC}        ${C_TEXT}Not connected${NC}"
+            fi
 
-        if [[ -n "$SELECTED_REPO" ]]; then
-            draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Repository${NC}    ${C_TEXT}${SELECTED_REPO}${NC}"
-        else
-            draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Repository${NC}    ${C_DIM}None selected${NC}"
+            if [[ -n "$SELECTED_REPO" ]]; then
+                draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Repository${NC}    ${C_TEXT}${SELECTED_REPO}${NC}"
+            else
+                draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Repository${NC}    ${C_DIM}None selected${NC}"
+            fi
         fi
 
         draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Network${NC}       ${C_TEXT}host mode${NC}"
@@ -632,12 +772,23 @@ screen_main_menu() {
 
         # Build menu options
         local options=()
-        if [[ -n "$SELECTED_REPO" && -n "$GH_USER" ]]; then
-            options+=("🚀  Launch Sandbox")
+
+        if [[ "$LOCAL_MODE" == true ]]; then
+            if [[ -n "$SELECTED_REPO" ]]; then
+                options+=("🚀  Launch Sandbox")
+            fi
+            options+=("📂  Select Directory")
+            options+=("🔄  Switch to GitHub")
+            options+=("❌  Exit")
+        else
+            if [[ -n "$SELECTED_REPO" && -n "$GH_USER" ]]; then
+                options+=("🚀  Launch Sandbox")
+            fi
+            options+=("📂  Select Repository")
+            options+=("🔄  Switch to Local")
+            options+=("👤  Switch Account")
+            options+=("❌  Exit")
         fi
-        options+=("📂  Select Repository")
-        options+=("👤  Switch Account")
-        options+=("❌  Exit")
 
         local choice
         choice=$(printf '%s\n' "${options[@]}" | gum choose --height=8)
@@ -650,6 +801,21 @@ screen_main_menu() {
                 ;;
             "📂  Select Repository")
                 screen_repo_select
+                ;;
+            "📂  Select Directory")
+                screen_local_path
+                ;;
+            "🔄  Switch to GitHub")
+                LOCAL_MODE=false
+                LOCAL_PATH=""
+                SELECTED_REPO=""
+                SELECTED_REPO_URL=""
+                ;;
+            "🔄  Switch to Local")
+                LOCAL_MODE=true
+                SELECTED_REPO=""
+                SELECTED_REPO_URL=""
+                screen_local_path
                 ;;
             "👤  Switch Account")
                 screen_switch_account
@@ -798,9 +964,38 @@ main() {
     # Direct invocation with args
     if [[ $# -gt 0 ]]; then
         check_deps
-        refresh_gh_user
 
         local input="$1"
+
+        # Check if it's a local path (starts with . / ~ or is an existing directory)
+        if [[ "$input" == "." || "$input" == ".." || "$input" == /* || "$input" == ~* || -d "$input" ]]; then
+            # Local mode
+            LOCAL_MODE=true
+
+            # Expand ~ and resolve to absolute path
+            input="${input/#\~/$HOME}"
+            LOCAL_PATH=$(cd "$input" 2>/dev/null && pwd) || {
+                echo -e "  ${C_ERROR}${CROSS}${NC} Directory not found: ${input}"
+                exit 1
+            }
+
+            # Check if it's a git repo
+            if [[ ! -d "$LOCAL_PATH/.git" ]]; then
+                echo -e "  ${C_ERROR}${CROSS}${NC} Not a git repository: ${LOCAL_PATH}"
+                exit 1
+            fi
+
+            SELECTED_REPO=$(basename "$LOCAL_PATH")
+            echo -e "  ${C_SUCCESS}${CHECK}${NC} Local repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
+
+            if screen_launch_confirm; then
+                launch_sandbox
+            fi
+            exit 0
+        fi
+
+        # GitHub mode
+        refresh_gh_user
 
         if [[ "$input" == http* || "$input" == git@* ]]; then
             SELECTED_REPO_URL="$input"
@@ -825,6 +1020,12 @@ main() {
     check_deps
     screen_welcome
     detect_current_repo
+
+    # If no repo detected from current dir, show source selection
+    if [[ -z "$SELECTED_REPO" ]]; then
+        screen_source_select
+    fi
+
     screen_main_menu
 }
 

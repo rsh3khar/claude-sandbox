@@ -1,12 +1,22 @@
 #!/bin/bash
 set -e
 
-GIT_URL="$1"
-shift || true
+# Check for local mode flag
+LOCAL_MODE="${LOCAL_MODE:-}"
+if [[ "$1" == "--local" ]]; then
+    LOCAL_MODE=1
+    shift
+    REPO_NAME="$1"
+    shift || true
+else
+    GIT_URL="$1"
+    shift || true
 
-if [[ -z "$GIT_URL" ]]; then
-    echo "Usage: docker run ... <git-url>"
-    exit 1
+    if [[ -z "$GIT_URL" ]]; then
+        echo "Usage: docker run ... <git-url>"
+        echo "       docker run ... --local <repo-name>"
+        exit 1
+    fi
 fi
 
 # Colors
@@ -62,13 +72,17 @@ resolve_skill_symlinks() {
 
 resolve_skill_symlinks
 
-# Extract repo name from URL
-REPO_NAME=$(basename "$GIT_URL" .git)
-
-# Clone
-echo -e "${C_DIM}Cloning ${REPO_NAME}...${NC}"
-git clone --quiet "$GIT_URL" ~/workspace/"$REPO_NAME"
-cd ~/workspace/"$REPO_NAME"
+if [[ -n "$LOCAL_MODE" ]]; then
+    # Local mode: repo is already mounted
+    echo -e "${C_DIM}Using local repo: ${REPO_NAME}${NC}"
+    cd ~/workspace/"$REPO_NAME"
+else
+    # GitHub mode: clone
+    REPO_NAME=$(basename "$GIT_URL" .git)
+    echo -e "${C_DIM}Cloning ${REPO_NAME}...${NC}"
+    git clone --quiet "$GIT_URL" ~/workspace/"$REPO_NAME"
+    cd ~/workspace/"$REPO_NAME"
+fi
 
 # Configure git identity
 [[ -n "${GIT_USER_NAME:-}" ]] && git config user.name "$GIT_USER_NAME"
@@ -77,10 +91,17 @@ cd ~/workspace/"$REPO_NAME"
 # Function to show branch menu
 show_branch_menu() {
     CURRENT=$(git branch --show-current)
-    REMOTE_BRANCHES=$(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//' | sort -u)
+
+    if [[ -n "$LOCAL_MODE" ]]; then
+        # Local mode: use local branches
+        ALL_BRANCHES=$(git branch | sed 's/^[* ]*//' | sort -u)
+    else
+        # GitHub mode: use remote branches
+        ALL_BRANCHES=$(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//' | sort -u)
+    fi
 
     # Count sandbox branches
-    SANDBOX_BRANCHES=$(echo "$REMOTE_BRANCHES" | grep -E "^sandbox-" || true)
+    SANDBOX_BRANCHES=$(echo "$ALL_BRANCHES" | grep -E "^sandbox-" || true)
     if [[ -n "$SANDBOX_BRANCHES" ]]; then
         SANDBOX_COUNT=$(echo "$SANDBOX_BRANCHES" | wc -l | tr -d ' ')
     else
@@ -89,29 +110,48 @@ show_branch_menu() {
 
     echo ""
     echo -e "${C_TEXT}${BOLD}Select a branch${NC}"
+    if [[ -n "$LOCAL_MODE" ]]; then
+        echo -e "${C_DIM}(main/master blocked for local sandboxing)${NC}"
+    fi
     echo ""
 
     # Store branches in array for selection
     BRANCH_ARRAY=()
     while IFS= read -r b; do
         [[ -n "$b" ]] && BRANCH_ARRAY+=("$b")
-    done <<< "$REMOTE_BRANCHES"
+    done <<< "$ALL_BRANCHES"
 
     # Display numbered list
     for i in "${!BRANCH_ARRAY[@]}"; do
         b="${BRANCH_ARRAY[$i]}"
         num=$((i + 1))
 
-        if [[ "$b" =~ ^sandbox- ]]; then
+        # Check if blocked (main/master in local mode)
+        local is_blocked=false
+        if [[ -n "$LOCAL_MODE" && ("$b" == "main" || "$b" == "master") ]]; then
+            is_blocked=true
+        fi
+
+        if [[ "$is_blocked" == true ]]; then
+            ICON="${C_ERROR}✗${NC}"
+        elif [[ "$b" =~ ^sandbox- ]]; then
             ICON="${C_DIM}◇${NC}"
         else
             ICON="${C_SUCCESS}●${NC}"
         fi
 
         if [[ "$b" == "$CURRENT" ]]; then
-            echo -e "  ${C_ACCENT}${num})${NC} ${ICON} ${C_TEXT}$b${NC} ${C_DIM}(current)${NC}"
+            if [[ "$is_blocked" == true ]]; then
+                echo -e "  ${C_DIM}${num})${NC} ${ICON} ${C_DIM}$b${NC} ${C_ERROR}(blocked)${NC}"
+            else
+                echo -e "  ${C_ACCENT}${num})${NC} ${ICON} ${C_TEXT}$b${NC} ${C_SUCCESS}(current)${NC}"
+            fi
         else
-            echo -e "  ${C_DIM}${num})${NC} ${ICON} ${C_DIM}$b${NC}"
+            if [[ "$is_blocked" == true ]]; then
+                echo -e "  ${C_DIM}${num})${NC} ${ICON} ${C_DIM}$b${NC} ${C_ERROR}(blocked)${NC}"
+            else
+                echo -e "  ${C_DIM}${num})${NC} ${ICON} ${C_DIM}$b${NC}"
+            fi
         fi
     done
 
@@ -120,7 +160,11 @@ show_branch_menu() {
     echo -e "  ${C_ACCENT}q)${NC} ${C_TEXT}Quick branch${NC} ${C_DIM}(auto: sandbox-timestamp)${NC}"
 
     if [[ "$SANDBOX_COUNT" -gt 0 ]]; then
-        echo -e "  ${C_DIM}d)${NC} ${C_DIM}Delete sandbox branches${NC} ${C_DIM}(${SANDBOX_COUNT} found)${NC}"
+        if [[ -n "$LOCAL_MODE" ]]; then
+            echo -e "  ${C_DIM}d)${NC} ${C_DIM}Delete sandbox branches${NC} ${C_DIM}(${SANDBOX_COUNT} local)${NC}"
+        else
+            echo -e "  ${C_DIM}d)${NC} ${C_DIM}Delete sandbox branches${NC} ${C_DIM}(${SANDBOX_COUNT} found)${NC}"
+        fi
     fi
 
     echo ""
@@ -139,13 +183,23 @@ show_branch_menu() {
             read -p "▸ Delete all? [y/N]: " CONFIRM
             if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
                 echo ""
-                echo "$SANDBOX_BRANCHES" | while read -r b; do
-                    [[ -n "$b" ]] && git push origin --delete "$b" 2>/dev/null && echo -e "  ${C_SUCCESS}✓${NC} Deleted $b"
-                done
+                if [[ -n "$LOCAL_MODE" ]]; then
+                    # Delete local branches
+                    echo "$SANDBOX_BRANCHES" | while read -r b; do
+                        [[ -n "$b" ]] && git branch -D "$b" 2>/dev/null && echo -e "  ${C_SUCCESS}✓${NC} Deleted local $b"
+                    done
+                else
+                    # Delete remote branches
+                    echo "$SANDBOX_BRANCHES" | while read -r b; do
+                        [[ -n "$b" ]] && git push origin --delete "$b" 2>/dev/null && echo -e "  ${C_SUCCESS}✓${NC} Deleted $b"
+                    done
+                fi
             fi
         fi
         # Refresh and show menu again
-        git fetch --prune --quiet 2>/dev/null || true
+        if [[ -z "$LOCAL_MODE" ]]; then
+            git fetch --prune --quiet 2>/dev/null || true
+        fi
         show_branch_menu
         return
     fi
@@ -205,7 +259,9 @@ show_branch_menu() {
         if [[ -n "$BRANCH_NAME" ]]; then
             echo ""
             git checkout -b "$BRANCH_NAME" --quiet
-            git push -u origin "$BRANCH_NAME" --quiet 2>/dev/null || true
+            if [[ -z "$LOCAL_MODE" ]]; then
+                git push -u origin "$BRANCH_NAME" --quiet 2>/dev/null || true
+            fi
             echo -e "${C_SUCCESS}✓${NC} Created ${C_ACCENT}${BRANCH_NAME}${NC} ${C_DIM}from ${BASE_BRANCH}${NC}"
         fi
         return
@@ -215,6 +271,18 @@ show_branch_menu() {
     if [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
         idx=$((CHOICE - 1))
         SELECTED="${BRANCH_ARRAY[$idx]}"
+
+        # Block main/master in local mode
+        if [[ -n "$LOCAL_MODE" && ("$SELECTED" == "main" || "$SELECTED" == "master") ]]; then
+            echo ""
+            echo -e "${C_ERROR}✗${NC} Cannot sandbox on ${C_ACCENT}${SELECTED}${NC} in local mode"
+            echo -e "${C_DIM}  Please select another branch or create a new one${NC}"
+            echo ""
+            sleep 1
+            show_branch_menu
+            return
+        fi
+
         if [[ -n "$SELECTED" && "$SELECTED" != "$CURRENT" ]]; then
             git checkout "$SELECTED" --quiet
             echo ""
@@ -261,21 +329,28 @@ cleanup() {
         echo -e "${C_DIM}Saving final changes...${NC}"
         git add -A -- ':!CLAUDE.md' ':!CLAUDE.md.original'
         git commit -m "wip: session end" --no-verify 2>/dev/null || true
-        git push 2>/dev/null || true
+        if [[ -z "$LOCAL_MODE" ]]; then
+            git push 2>/dev/null || true
+        fi
     fi
     echo -e "${C_DIM}Goodbye!${NC}"
 }
 trap cleanup EXIT
 
-# Start auto-git with repo path
-auto-git 60 ~/workspace/"$REPO_NAME" > /tmp/auto-git.log 2>&1 &
+# Start auto-git with repo path (pass LOCAL_MODE)
+LOCAL_MODE="$LOCAL_MODE" auto-git 60 ~/workspace/"$REPO_NAME" > /tmp/auto-git.log 2>&1 &
 disown $!
 
 echo -e "${C_DIM}─────────────────────────────────────────${NC}"
 echo ""
 echo -e "  ${C_TEXT}Repo:${NC}       ${C_ACCENT}${REPO_NAME}${NC}"
 echo -e "  ${C_TEXT}Branch:${NC}     ${C_ACCENT}$(git branch --show-current)${NC}"
-echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (when changes exist)${NC}"
+if [[ -n "$LOCAL_MODE" ]]; then
+    echo -e "  ${C_TEXT}Mode:${NC}       ${C_WARN}Local${NC} ${C_DIM}(no push)${NC}"
+    echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (local commits only)${NC}"
+else
+    echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (when changes exist)${NC}"
+fi
 echo ""
 echo -e "  ${C_DIM}Type ${C_TEXT}claude${C_DIM} to start Claude Code${NC}"
 echo -e "  ${C_DIM}Screenshots: save to ${C_TEXT}~/.claude/screenshots/${C_DIM} on host${NC}"
