@@ -31,9 +31,12 @@ echo ""
 echo -e "${C_ACCENT}${BOLD}◈ CLAUDE SANDBOX${NC}"
 echo ""
 
-# Fix SSH socket permissions
+# Fix SSH socket permissions (Docker Desktop or OrbStack)
 if [[ -S "/run/host-services/ssh-auth.sock" ]]; then
     sudo chmod 666 /run/host-services/ssh-auth.sock 2>/dev/null || true
+fi
+if [[ -S "/tmp/ssh-agent.sock" ]]; then
+    sudo chmod 666 /tmp/ssh-agent.sock 2>/dev/null || true
 fi
 
 # SSH setup

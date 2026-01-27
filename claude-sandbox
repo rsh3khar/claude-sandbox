@@ -645,11 +645,21 @@ launch_sandbox() {
     echo -e "  ${C_ACCENT}▸${NC} Launching container..."
     echo ""
 
-    # SSH agent forwarding for OrbStack/Docker Desktop
-    local ssh_args=(
-        "-v" "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock"
-        "-e" "SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock"
-    )
+    # SSH agent forwarding - detect socket location
+    local ssh_args=()
+    if [[ -S "/run/host-services/ssh-auth.sock" ]]; then
+        # Docker Desktop on macOS
+        ssh_args=(
+            "-v" "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock"
+            "-e" "SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock"
+        )
+    elif [[ -n "$SSH_AUTH_SOCK" && -S "$SSH_AUTH_SOCK" ]]; then
+        # OrbStack / native macOS agent - mount the actual socket
+        ssh_args=(
+            "-v" "$SSH_AUTH_SOCK:/tmp/ssh-agent.sock"
+            "-e" "SSH_AUTH_SOCK=/tmp/ssh-agent.sock"
+        )
+    fi
 
     # Git identity from host
     local git_name git_email
