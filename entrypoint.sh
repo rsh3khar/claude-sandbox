@@ -97,7 +97,11 @@ show_branch_menu() {
 
     if [[ -n "$LOCAL_MODE" ]]; then
         # Local mode: use local branches
-        ALL_BRANCHES=$(git branch | sed 's/^[* ]*//' | sort -u)
+        ALL_BRANCHES=$(git branch --format='%(refname:short)' 2>/dev/null | sort -u)
+        # If no branches (no commits yet), use current branch name
+        if [[ -z "$ALL_BRANCHES" && -n "$CURRENT" ]]; then
+            ALL_BRANCHES="$CURRENT"
+        fi
     else
         # GitHub mode: use remote branches
         ALL_BRANCHES=$(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//' | sort -u)
@@ -113,9 +117,6 @@ show_branch_menu() {
 
     echo ""
     echo -e "${C_TEXT}${BOLD}Select a branch${NC}"
-    if [[ -n "$LOCAL_MODE" ]]; then
-        echo -e "${C_DIM}(main/master blocked for local sandboxing)${NC}"
-    fi
     echo ""
 
     # Store branches in array for selection
@@ -129,32 +130,16 @@ show_branch_menu() {
         b="${BRANCH_ARRAY[$i]}"
         num=$((i + 1))
 
-        # Check if blocked (main/master in local mode)
-        local is_blocked=false
-        if [[ -n "$LOCAL_MODE" && ("$b" == "main" || "$b" == "master") ]]; then
-            is_blocked=true
-        fi
-
-        if [[ "$is_blocked" == true ]]; then
-            ICON="${C_ERROR}✗${NC}"
-        elif [[ "$b" =~ ^sandbox- ]]; then
+        if [[ "$b" =~ ^sandbox- ]]; then
             ICON="${C_DIM}◇${NC}"
         else
             ICON="${C_SUCCESS}●${NC}"
         fi
 
         if [[ "$b" == "$CURRENT" ]]; then
-            if [[ "$is_blocked" == true ]]; then
-                echo -e "  ${C_DIM}${num})${NC} ${ICON} ${C_DIM}$b${NC} ${C_ERROR}(blocked)${NC}"
-            else
-                echo -e "  ${C_ACCENT}${num})${NC} ${ICON} ${C_TEXT}$b${NC} ${C_SUCCESS}(current)${NC}"
-            fi
+            echo -e "  ${C_ACCENT}${num})${NC} ${ICON} ${C_TEXT}$b${NC} ${C_SUCCESS}(current)${NC}"
         else
-            if [[ "$is_blocked" == true ]]; then
-                echo -e "  ${C_DIM}${num})${NC} ${ICON} ${C_DIM}$b${NC} ${C_ERROR}(blocked)${NC}"
-            else
-                echo -e "  ${C_DIM}${num})${NC} ${ICON} ${C_DIM}$b${NC}"
-            fi
+            echo -e "  ${C_DIM}${num})${NC} ${ICON} ${C_DIM}$b${NC}"
         fi
     done
 
@@ -275,17 +260,6 @@ show_branch_menu() {
         idx=$((CHOICE - 1))
         SELECTED="${BRANCH_ARRAY[$idx]}"
 
-        # Block main/master in local mode
-        if [[ -n "$LOCAL_MODE" && ("$SELECTED" == "main" || "$SELECTED" == "master") ]]; then
-            echo ""
-            echo -e "${C_ERROR}✗${NC} Cannot sandbox on ${C_ACCENT}${SELECTED}${NC} in local mode"
-            echo -e "${C_DIM}  Please select another branch or create a new one${NC}"
-            echo ""
-            sleep 1
-            show_branch_menu
-            return
-        fi
-
         if [[ -n "$SELECTED" && "$SELECTED" != "$CURRENT" ]]; then
             git checkout "$SELECTED" --quiet
             echo ""
@@ -355,7 +329,8 @@ else
     echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (when changes exist)${NC}"
 fi
 echo ""
-echo -e "  ${C_DIM}Type ${C_TEXT}claude${C_DIM} to start Claude Code${NC}"
+echo -e "  ${C_DIM}Type ${C_TEXT}c${C_DIM} or ${C_TEXT}claude${C_DIM} for Claude Code${NC}"
+echo -e "  ${C_DIM}Type ${C_TEXT}x${C_DIM} or ${C_TEXT}codex${C_DIM} for OpenAI Codex${NC}"
 echo -e "  ${C_DIM}Screenshots: save to ${C_TEXT}~/.claude/screenshots/${C_DIM} on host${NC}"
 echo ""
 echo -e "${C_DIM}─────────────────────────────────────────${NC}"

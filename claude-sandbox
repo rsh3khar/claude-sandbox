@@ -695,6 +695,7 @@ launch_sandbox() {
             -e "CLAUDE_SANDBOX=1" \
             -e "LOCAL_MODE=1" \
             -v "$HOME/.claude:/home/node/.claude" \
+            -v "$HOME/.codex:/home/node/.codex" \
             -v "$HOME/.ssh:/home/node/.ssh-host:ro" \
             -v "$LOCAL_PATH:/home/node/workspace/$SELECTED_REPO" \
             -e "GIT_USER_NAME=$git_name" \
@@ -716,6 +717,7 @@ launch_sandbox() {
             -e "TERM=${TERM:-xterm-256color}" \
             -e "CLAUDE_SANDBOX=1" \
             -v "$HOME/.claude:/home/node/.claude" \
+            -v "$HOME/.codex:/home/node/.codex" \
             -v "$HOME/.ssh:/home/node/.ssh-host:ro" \
             -e "GIT_USER_NAME=$git_name" \
             -e "GIT_USER_EMAIL=$git_email" \

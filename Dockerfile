@@ -53,6 +53,10 @@ RUN sed -i 's|^ZSH_THEME=".*"|ZSH_THEME="powerlevel10k/powerlevel10k"|' ~/.zshrc
     && echo 'alias claude="claude --dangerously-skip-permissions"' >> ~/.zshrc \
     && echo 'alias c="claude --dangerously-skip-permissions"' >> ~/.zshrc \
     && echo '' >> ~/.zshrc \
+    && echo '# Codex sandbox aliases' >> ~/.zshrc \
+    && echo 'alias codex="command codex --full-auto"' >> ~/.zshrc \
+    && echo 'alias x="command codex --full-auto"' >> ~/.zshrc \
+    && echo '' >> ~/.zshrc \
     && echo '# Python helpers' >> ~/.zshrc \
     && echo 'alias pip="pip3 --break-system-packages"' >> ~/.zshrc
 
@@ -65,6 +69,11 @@ ENV SHELL=/bin/zsh
 
 # Install Claude Code CLI (native method)
 RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Install OpenAI Codex CLI (needs root for global install)
+USER root
+RUN npm install -g @openai/codex
+USER node
 
 # Add claude to PATH
 ENV PATH="/home/node/.local/bin:$PATH"
