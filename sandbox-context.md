@@ -42,7 +42,15 @@ User takes screenshots with `Cmd+Shift+4` which saves directly to the shared fol
 - On exit: final commit with message "wip: session end"
 - Check logs: `cat /tmp/auto-git.log`
 
-## Environment
+## Environment Notes
+
+- **Python**: System Python 3 with pip. Do NOT use conda — it is not available in the container.
+- **pip**: `pip install <package>` works directly (no flags needed)
+- **Pre-installed**: boto3, requests, jq
+- **AWS**: If credentials fail, tell the user to run `aws sso login` on the HOST machine, then retry inside the container
+- The global `~/.claude/CLAUDE.md` may reference conda environments — ignore those instructions inside the sandbox
+
+## Environment Variables
 
 | Variable | Purpose |
 |----------|---------|

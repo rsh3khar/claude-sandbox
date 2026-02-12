@@ -16,9 +16,12 @@ Claude Code's `--dangerously-skip-permissions` flag lets Claude execute commands
 ## Features
 
 - Interactive branch selection and creation
+- **Local mode** - work on local repos without cloning (`cs .`)
 - Auto-commit changes to GitHub every 60s
+- Host credential forwarding (AWS SSO, GitHub CLI, SSH)
+- Claude Code + [OpenAI Codex](https://github.com/openai/codex) support
+- Python + Node.js + common tools (jq, boto3, requests, AWS CLI) pre-installed
 - Beautiful terminal UI with Powerlevel10k
-- Python + Node.js support out of the box
 - Host network mode - any port just works
 
 ## Requirements
@@ -85,20 +88,32 @@ This opens an interactive menu to:
 - Choose or create a branch
 - Launch the sandbox
 
-### Direct Mode
+### Local Mode
+
+Mount a local repo directly (no clone, changes stay local):
 
 ```bash
-claude-sandbox owner/repo
-claude-sandbox git@github.com:owner/repo.git
+cs .                    # Current directory
+cs ~/projects/my-app    # Any local git repo
+```
+
+### GitHub Mode
+
+Clone from GitHub into an isolated container:
+
+```bash
+cs owner/repo
+cs git@github.com:owner/repo.git
 ```
 
 ### Inside the Sandbox
 
 ```bash
-# Start Claude Code (auto-skips permissions)
-claude
-# or
-c
+# Claude Code (auto-skips permissions)
+c       # or: claude
+
+# OpenAI Codex
+x       # or: codex
 
 # Your changes auto-commit every 60s
 # Just work and let the sandbox handle git
@@ -110,29 +125,21 @@ c
 ┌─────────────────────────────────────────────────────────────────┐
 │  Host (macOS/Linux)                                             │
 │                                                                 │
-│  ┌─────────────────────┐  ┌─────────────────┐  ┌────────────┐  │
-│  │ ~/.claude/          │  │ ~/.ssh/         │  │ SSH Agent  │  │
-│  │ ├── settings        │  │ (read-only)     │  │ Socket     │  │
-│  │ └── screenshots/ ◄──┼──┼─ Cmd+Shift+4    │  │            │  │
-│  └──────────┬──────────┘  └────────┬────────┘  └─────┬──────┘  │
-│             │                      │                  │         │
-└─────────────┼──────────────────────┼──────────────────┼─────────┘
-              │ mount                │ mount            │ forward
-              ▼                      ▼                  ▼
+│  ~/.claude/    ~/.ssh/    ~/.aws/    ~/.config/gh/   SSH Agent  │
+│       │           │          │            │              │      │
+└───────┼───────────┼──────────┼────────────┼──────────────┼──────┘
+        │ mount     │ mount    │ mount      │ mount        │ fwd
+        ▼           ▼          ▼            ▼              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Container (isolated)                                           │
+│  Container (isolated, destroyed on exit)                        │
 │                                                                 │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │ ~/workspace/<repo>/     Fresh git clone                   │  │
-│  │ ~/.claude/screenshots/  Claude reads screenshots here     │  │
-│  │                                                           │  │
-│  │ Claude Code (--dangerously-skip-permissions)              │  │
-│  │ Auto-git daemon (commits every 60s)                       │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  Container destroyed on exit - host untouched                   │
+│  ~/workspace/<repo>/    Git clone or local mount                │
+│  Claude Code + Codex    (--dangerously-skip-permissions)        │
+│  Auto-git daemon        Commits every 60s                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+All host mounts are guarded — only mounted if the directory exists.
 
 ## Branch Management
 
@@ -175,20 +182,7 @@ The installer will guide you through this.
 
 ## Configuration
 
-Files are installed to `~/.claude-sandbox/`:
-
-```
-~/.claude-sandbox/
-├── Dockerfile       # Container definition
-├── claude-sandbox   # Main CLI
-├── entrypoint.sh    # Container startup
-├── auto-git.sh      # Auto-commit daemon
-└── p10k.zsh         # Terminal theme config
-```
-
-Token stored at `~/.claude-sandbox-token` (chmod 600).
-
-**Terminal theme:** The container uses a [Powerlevel10k](https://github.com/romkatv/powerlevel10k) config included in `p10k.zsh`. Customize it to change the terminal appearance.
+Files are installed to `~/.claude-sandbox/`. Token stored at `~/.claude-sandbox-token` (chmod 600).
 
 ## Running Dev Servers
 
@@ -241,6 +235,14 @@ killall SystemUIServer
 
 ## Troubleshooting
 
+### AWS credentials not working
+
+Credentials are bind-mounted from `~/.aws`, not copied. Refresh on the **host**:
+```bash
+aws sso login           # On host, not inside container
+```
+The container picks up the refresh immediately — no restart needed.
+
 ### SSH not working
 
 Make sure your SSH agent is running:
@@ -253,17 +255,13 @@ ssh-add -l  # Should list your keys
 Your OAuth token might be missing or expired:
 ```bash
 claude setup-token
-echo 'NEW_TOKEN' > ~/.claude-sandbox-token
+echo 'YOUR_TOKEN' > ~/.claude-sandbox-token
 ```
 
 ### Port not accessible
 
-Make sure you bind to `0.0.0.0`, not `127.0.0.1`:
+Bind to `0.0.0.0`, not `127.0.0.1`:
 ```bash
-# Wrong
-npm run dev  # binds to 127.0.0.1
-
-# Right
 npm run dev -- --host  # binds to 0.0.0.0
 ```
 

@@ -276,35 +276,16 @@ show_branch_menu
 
 echo ""
 
-# Set up CLAUDE.md with sandbox context (AFTER branch selection to avoid checkout conflicts)
-SANDBOX_TEMPLATE="/usr/local/share/sandbox-context.md"
-SANDBOX_MARKER="<!-- END SANDBOX CONTEXT -->"
-
-HAD_CLAUDE_MD=false
-if [[ -f "CLAUDE.md" ]]; then
-    HAD_CLAUDE_MD=true
-    # Repo has existing CLAUDE.md - prepend sandbox context if not already there
-    if ! grep -q "$SANDBOX_MARKER" CLAUDE.md 2>/dev/null; then
-        cp CLAUDE.md CLAUDE.md.original
-        cat "$SANDBOX_TEMPLATE" CLAUDE.md.original > CLAUDE.md
-        echo -e "${C_DIM}Added sandbox context to CLAUDE.md${NC}"
-    fi
-else
-    cp "$SANDBOX_TEMPLATE" CLAUDE.md
-    echo -e "${C_DIM}Created CLAUDE.md with sandbox context${NC}"
-fi
-export HAD_CLAUDE_MD
-
 # Cleanup trap
 cleanup() {
     echo ""
     echo -e "${C_DIM}Shutting down...${NC}"
     cd ~/workspace/"$REPO_NAME" 2>/dev/null || exit 0
 
-    # Check for changes (excluding sandbox files)
-    if [[ -n $(git status --porcelain -- ':!CLAUDE.md' ':!CLAUDE.md.original' 2>/dev/null) ]]; then
+    # Check for changes — skip if auto-git disabled
+    if [[ -z "${DISABLE_AUTO_GIT:-}" ]] && [[ -n $(git status --porcelain 2>/dev/null) ]]; then
         echo -e "${C_DIM}Saving final changes...${NC}"
-        git add -A -- ':!CLAUDE.md' ':!CLAUDE.md.original'
+        git add -A
         git commit -m "wip: session end" --no-verify 2>/dev/null || true
         if [[ -z "$LOCAL_MODE" ]]; then
             git push 2>/dev/null || true
@@ -314,9 +295,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Start auto-git with repo path (pass LOCAL_MODE)
-LOCAL_MODE="$LOCAL_MODE" auto-git 60 ~/workspace/"$REPO_NAME" > /tmp/auto-git.log 2>&1 &
-disown $!
+# Start auto-git with repo path (pass LOCAL_MODE) unless disabled
+if [[ -n "${DISABLE_AUTO_GIT:-}" ]]; then
+    echo -e "${C_DIM}Auto-save: disabled${NC}"
+else
+    LOCAL_MODE="$LOCAL_MODE" auto-git 60 ~/workspace/"$REPO_NAME" > /tmp/auto-git.log 2>&1 &
+    disown $!
+fi
 
 echo -e "${C_DIM}─────────────────────────────────────────${NC}"
 echo ""
@@ -324,9 +309,15 @@ echo -e "  ${C_TEXT}Repo:${NC}       ${C_ACCENT}${REPO_NAME}${NC}"
 echo -e "  ${C_TEXT}Branch:${NC}     ${C_ACCENT}$(git branch --show-current)${NC}"
 if [[ -n "$LOCAL_MODE" ]]; then
     echo -e "  ${C_TEXT}Mode:${NC}       ${C_WARN}Local${NC} ${C_DIM}(no push)${NC}"
-    echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (local commits only)${NC}"
+fi
+if [[ -n "${DISABLE_AUTO_GIT:-}" ]]; then
+    echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_WARN}disabled${NC}"
 else
-    echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (when changes exist)${NC}"
+    if [[ -n "$LOCAL_MODE" ]]; then
+        echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (local commits only)${NC}"
+    else
+        echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (when changes exist)${NC}"
+    fi
 fi
 echo ""
 echo -e "  ${C_DIM}Type ${C_TEXT}c${C_DIM} or ${C_TEXT}claude${C_DIM} for Claude Code${NC}"

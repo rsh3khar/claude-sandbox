@@ -46,6 +46,8 @@ GH_USER=""
 GH_USER_DATA=""
 LOCAL_MODE=false
 LOCAL_PATH=""
+AUTO_GIT=true
+EXTRA_PATHS=()   # Additional local directories to mount
 
 IMAGE_NAME="claude-sandbox"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -204,11 +206,25 @@ progress_bar() {
 # └─────────────────────────────────────────────────────────────────────────┘
 
 refresh_gh_user() {
-    if gh auth status &>/dev/null; then
-        GH_USER=$(gh api user --jq '.login' 2>/dev/null || echo "")
-        if [[ -n "$GH_USER" ]]; then
-            GH_USER_DATA=$(gh api user 2>/dev/null || echo "")
+    local tmpfile
+    tmpfile=$(mktemp)
+    trap "rm -f '$tmpfile'" RETURN
+
+    # Run API calls in background so we can show a spinner
+    (
+        if gh auth status &>/dev/null; then
+            local user
+            user=$(gh api user 2>/dev/null || echo "")
+            if [[ -n "$user" ]]; then
+                echo "$user" > "$tmpfile"
+            fi
         fi
+    ) &
+    animate_spinner $! "Connecting to GitHub..."
+
+    if [[ -s "$tmpfile" ]]; then
+        GH_USER_DATA=$(cat "$tmpfile")
+        GH_USER=$(echo "$GH_USER_DATA" | jq -r '.login // ""')
     else
         GH_USER=""
         GH_USER_DATA=""
@@ -293,13 +309,31 @@ draw_user_card() {
         return
     fi
 
-    local name followers public_repos private_repos
+    local name followers public_repos
     name=$(echo "$GH_USER_DATA" | jq -r '.name // .login')
     followers=$(echo "$GH_USER_DATA" | jq -r '.followers // 0')
     public_repos=$(echo "$GH_USER_DATA" | jq -r '.public_repos // 0')
+    local total_private_repos
+    total_private_repos=$(echo "$GH_USER_DATA" | jq -r '.total_private_repos // .owned_private_repos // 0')
 
-    # API doesn't always return private count, so count via repo list
-    private_repos=$(gh repo list --limit 10000 --json isPrivate --jq '[.[] | select(.isPrivate == true)] | length' 2>/dev/null || echo "0")
+    # Fetch private repo count + contribution graph in parallel (background)
+    local contrib_tmpfile
+    contrib_tmpfile=$(mktemp)
+
+    (draw_contribution_graph "$username" > "$contrib_tmpfile" 2>/dev/null) &
+    local contrib_pid=$!
+
+    # If API didn't give us private count, fetch it (slow path)
+    local private_repos="$total_private_repos"
+    if [[ "$private_repos" == "0" || "$private_repos" == "null" ]]; then
+        local priv_tmpfile
+        priv_tmpfile=$(mktemp)
+        (gh repo list --limit 10000 --json isPrivate --jq '[.[] | select(.isPrivate == true)] | length' 2>/dev/null > "$priv_tmpfile" || echo "0" > "$priv_tmpfile") &
+        local priv_pid=$!
+        animate_spinner $priv_pid "Loading profile..."
+        private_repos=$(cat "$priv_tmpfile" 2>/dev/null || echo "0")
+        rm -f "$priv_tmpfile"
+    fi
 
     echo ""
     draw_box $w "GITHUB"
@@ -310,7 +344,87 @@ draw_user_card() {
     draw_box_row $w "${C_DIM}  ${BULLET} ${public_repos} public  ${BULLET} ${private_repos} private  ${BULLET} ${followers} followers${NC}"
     draw_box_bottom $w
 
-    draw_contribution_graph "$username"
+    # Wait for contribution graph to finish
+    if kill -0 "$contrib_pid" 2>/dev/null; then
+        animate_spinner $contrib_pid "Loading contributions..."
+    fi
+    wait "$contrib_pid" 2>/dev/null
+    cat "$contrib_tmpfile"
+    rm -f "$contrib_tmpfile"
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Extra Mount Helpers                                                     │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+# Resolve a unique mount name, appending -2, -3, etc. on collision
+resolve_mount_name() {
+    local base="$1"
+    local name="$base"
+    local suffix=2
+
+    # Check against primary repo
+    while true; do
+        local collision=false
+        if [[ "$name" == "$SELECTED_REPO" ]]; then
+            collision=true
+        fi
+        # Check against already-added extras (stored as path:mount_name pairs)
+        if [[ "$collision" == false ]]; then
+            for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+                local existing_name="${ep##*:}"
+                if [[ "$name" == "$existing_name" ]]; then
+                    collision=true
+                    break
+                fi
+            done
+        fi
+        if [[ "$collision" == false ]]; then
+            break
+        fi
+        name="${base}-${suffix}"
+        ((suffix++))
+    done
+
+    echo "$name"
+}
+
+# Validate a path and add it to EXTRA_PATHS. Returns 0 on success, 1 on failure.
+validate_and_add_extra_path() {
+    local raw_path="$1"
+
+    # Expand ~ and resolve
+    raw_path="${raw_path/#\~/$HOME}"
+    local abs_path
+    abs_path=$(cd "$raw_path" 2>/dev/null && pwd) || {
+        echo -e "  ${C_ERROR}${CROSS}${NC} Directory not found: ${raw_path}"
+        return 1
+    }
+
+    if [[ ! -d "$abs_path/.git" ]]; then
+        echo -e "  ${C_ERROR}${CROSS}${NC} Not a git repository: ${abs_path}"
+        return 1
+    fi
+
+    # Don't allow duplicates or mounting the primary path again
+    if [[ "$abs_path" == "$LOCAL_PATH" ]]; then
+        echo -e "  ${C_WARN}${BULLET}${NC} Already the primary repo: ${abs_path}"
+        return 1
+    fi
+    for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+        local existing_path="${ep%%:*}"
+        if [[ "$abs_path" == "$existing_path" ]]; then
+            echo -e "  ${C_WARN}${BULLET}${NC} Already added: ${abs_path}"
+            return 1
+        fi
+    done
+
+    local mount_name
+    mount_name=$(resolve_mount_name "$(basename "$abs_path")")
+    EXTRA_PATHS+=("${abs_path}:${mount_name}")
+
+    echo -e "  ${C_SUCCESS}${CHECK}${NC} Added: ${C_ACCENT}${mount_name}${NC} ${C_DIM}(${abs_path})${NC}"
+    return 0
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
@@ -321,7 +435,6 @@ screen_welcome() {
     clear
     draw_logo
 
-    gum spin --spinner dot --title "Connecting to GitHub..." -- bash -c 'sleep 0.5'
     refresh_gh_user
 
     if [[ -z "$GH_USER" ]]; then
@@ -423,6 +536,24 @@ screen_local_path() {
     echo ""
     echo -e "  ${C_SUCCESS}${CHECK}${NC} Found git repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
     sleep 1
+
+    # Offer to mount additional directories
+    EXTRA_PATHS=()
+    while true; do
+        echo ""
+        if ! gum confirm "Mount additional directories?"; then
+            break
+        fi
+
+        local extra_input
+        extra_input=$(gum input --placeholder="Path to another git repo...")
+
+        if [[ -z "$extra_input" ]]; then
+            break
+        fi
+
+        validate_and_add_extra_path "$extra_input" || sleep 1
+    done
 }
 
 screen_repo_select() {
@@ -521,8 +652,12 @@ confirm_repo() {
     echo ""
 
     # Fetch repo details
-    local info
-    info=$(gh repo view "$repo" --json name,owner,description,stargazerCount,forkCount,primaryLanguage,pushedAt 2>/dev/null || echo "")
+    local info info_tmpfile
+    info_tmpfile=$(mktemp)
+    (gh repo view "$repo" --json name,owner,description,stargazerCount,forkCount,primaryLanguage,pushedAt 2>/dev/null > "$info_tmpfile" || true) &
+    animate_spinner $! "Fetching repository..."
+    info=$(cat "$info_tmpfile" 2>/dev/null || echo "")
+    rm -f "$info_tmpfile"
 
     if [[ -z "$info" ]]; then
         echo -e "  ${C_ERROR}${CROSS}${NC} Could not fetch repository info"
@@ -560,7 +695,12 @@ confirm_repo() {
 
     if gum confirm "Use this repository?"; then
         SELECTED_REPO="$repo"
-        SELECTED_REPO_URL=$(gh repo view "$repo" --json sshUrl --jq '.sshUrl' 2>/dev/null)
+        local url_tmpfile
+        url_tmpfile=$(mktemp)
+        (gh repo view "$repo" --json sshUrl --jq '.sshUrl' 2>/dev/null > "$url_tmpfile" || true) &
+        animate_spinner $! "Resolving URL..."
+        SELECTED_REPO_URL=$(cat "$url_tmpfile" 2>/dev/null || echo "")
+        rm -f "$url_tmpfile"
     fi
 }
 
@@ -577,13 +717,24 @@ screen_launch_confirm() {
         draw_spacer $w
         draw_box_row $w "  ${C_DIM}Repository${NC}    ${C_BRIGHT}${SELECTED_REPO}${NC}"
         draw_box_row $w "  ${C_DIM}Path${NC}          ${C_TEXT}${LOCAL_PATH}${NC}"
+        if [[ ${#EXTRA_PATHS[@]} -gt 0 ]]; then
+            for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+                local ep_path="${ep%%:*}"
+                local ep_name="${ep##*:}"
+                draw_box_row $w "  ${C_ACCENT}+ mounted${NC}     ${C_TEXT}${ep_name}${NC} ${C_DIM}(${ep_path})${NC}"
+            done
+        fi
         draw_box_row $w "  ${C_DIM}Network${NC}       ${C_TEXT}host (all ports accessible)${NC}"
         draw_spacer $w
         draw_separator $w
         draw_spacer $w
         draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container isolated from filesystem${NC}"
         draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Local repo mounted (changes persist)${NC}"
-        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every 60s (local only)${NC}"
+        if [[ "$AUTO_GIT" == true ]]; then
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every 60s (local only)${NC}"
+        else
+            draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}Auto-save disabled${NC}"
+        fi
         draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}No push to remote${NC}"
         draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
         draw_spacer $w
@@ -599,7 +750,11 @@ screen_launch_confirm() {
         draw_spacer $w
         draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container isolated from filesystem${NC}"
         draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}SSH keys forwarded (never copied)${NC}"
-        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every 60s → GitHub${NC}"
+        if [[ "$AUTO_GIT" == true ]]; then
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every 60s → GitHub${NC}"
+        else
+            draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}Auto-save disabled${NC}"
+        fi
         draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
         draw_spacer $w
         draw_box_bottom $w
@@ -607,6 +762,14 @@ screen_launch_confirm() {
 
     echo ""
     echo -e "  ${C_DIM}Claude Code will run with ${C_ACCENT}--dangerously-skip-permissions${NC}"
+    echo ""
+
+    if gum confirm "Enable auto-save (commit every 60s)?"; then
+        AUTO_GIT=true
+    else
+        AUTO_GIT=false
+    fi
+
     echo ""
 
     if ! gum confirm "Launch sandbox?"; then
@@ -621,7 +784,13 @@ screen_launch_confirm() {
 # └─────────────────────────────────────────────────────────────────────────┘
 
 ensure_image() {
-    if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+    local inspect_result
+    inspect_result=$(mktemp)
+    (docker image inspect "$IMAGE_NAME" &>/dev/null && echo "exists" > "$inspect_result" || true) &
+    animate_spinner $! "Checking image..."
+
+    if [[ "$(cat "$inspect_result" 2>/dev/null)" != "exists" ]]; then
+        rm -f "$inspect_result"
         echo ""
         echo -e "  ${C_ACCENT}${BULLET}${NC} ${C_TEXT}Building sandbox image...${NC}"
         echo ""
@@ -630,6 +799,8 @@ ensure_image() {
         done
         echo ""
         echo -e "  ${C_SUCCESS}${CHECK}${NC} Image ready"
+    else
+        rm -f "$inspect_result"
     fi
 }
 
@@ -685,23 +856,100 @@ launch_sandbox() {
         echo -e "  ${C_WARN}${BULLET}${NC} ${C_DIM}No auth - run 'claude setup-token' and save to ~/.claude-sandbox-token${NC}"
     fi
 
+    # Optional host config mounts (AWS, gh CLI)
+    local extra_mounts=()
+
+    # Resolve GitHub token in background
+    local gh_tmpfile
+    gh_tmpfile=$(mktemp)
+
+    (gh auth token 2>/dev/null > "$gh_tmpfile" || true) &
+    local gh_pid=$!
+
+    # Claude config (should always exist, but guard anyway)
+    if [[ -d "$HOME/.claude" ]]; then
+        extra_mounts+=("-v" "$HOME/.claude:/home/node/.claude")
+    fi
+
+    # SSH keys for git operations
+    if [[ -d "$HOME/.ssh" ]]; then
+        extra_mounts+=("-v" "$HOME/.ssh:/home/node/.ssh-host:ro")
+    fi
+
+    # AWS: bind-mount ~/.aws so container always sees host's current credentials.
+    # No static credential export — env vars go stale in long-running containers.
+    # The SDK reads directly from the mounted config/SSO cache, so when the host
+    # refreshes (aws sso login), the container picks it up immediately.
+    if [[ -d "$HOME/.aws" ]]; then
+        extra_mounts+=("-v" "$HOME/.aws:/home/node/.aws")
+        # Validate that current session is active
+        if aws sts get-caller-identity &>/dev/null; then
+            echo -e "  ${C_SUCCESS}${CHECK}${NC} AWS credentials mounted (live session)"
+        else
+            echo -e "  ${C_WARN}${BULLET}${NC} ${C_DIM}AWS config mounted (no active session — run ${C_TEXT}aws sso login${C_DIM} on host)${NC}"
+        fi
+    fi
+    # Forward AWS_PROFILE / AWS_DEFAULT_REGION if set on host
+    [[ -n "${AWS_PROFILE:-}" ]] && auth_args+=("-e" "AWS_PROFILE=$AWS_PROFILE")
+    [[ -n "${AWS_DEFAULT_REGION:-}" ]] && auth_args+=("-e" "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION")
+    [[ -n "${AWS_REGION:-}" ]] && auth_args+=("-e" "AWS_REGION=$AWS_REGION")
+
+    animate_spinner $gh_pid "Forwarding credentials..."
+
+    # GitHub CLI: mount config for settings, then extract token from keyring
+    if [[ -d "$HOME/.config/gh" ]]; then
+        extra_mounts+=("-v" "$HOME/.config/gh:/home/node/.config/gh:ro")
+    fi
+
+    # Codex CLI config (only if exists)
+    if [[ -d "$HOME/.codex" ]]; then
+        extra_mounts+=("-v" "$HOME/.codex:/home/node/.codex")
+    fi
+    local gh_token
+    gh_token=$(cat "$gh_tmpfile" 2>/dev/null | tr -d '\n' || echo "")
+    rm -f "$gh_tmpfile"
+    if [[ -n "$gh_token" ]]; then
+        auth_args+=("-e" "GH_TOKEN=$gh_token")
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} GitHub CLI token forwarded"
+    elif [[ -d "$HOME/.config/gh" ]]; then
+        echo -e "  ${C_WARN}${BULLET}${NC} ${C_DIM}GitHub config mounted (token in keyring not accessible — run ${C_TEXT}gh auth login${C_DIM})${NC}"
+    fi
+
+    # Auto-git toggle
+    local auto_git_args=()
+    if [[ "$AUTO_GIT" == false ]]; then
+        auto_git_args+=("-e" "DISABLE_AUTO_GIT=1")
+        echo -e "  ${C_WARN}${BULLET}${NC} Auto-save disabled"
+    else
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Auto-save enabled"
+    fi
+
     if [[ "$LOCAL_MODE" == true ]]; then
         # Local mode: bind mount the repo, pass --local flag
         echo -e "  ${C_SUCCESS}${CHECK}${NC} Local mode: mounting ${LOCAL_PATH}"
+
+        # Build extra repo mount args
+        local extra_repo_mounts=()
+        for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+            local ep_path="${ep%%:*}"
+            local ep_name="${ep##*:}"
+            extra_repo_mounts+=("-v" "$ep_path:/home/node/workspace/$ep_name")
+            echo -e "  ${C_SUCCESS}${CHECK}${NC} Extra mount: ${ep_name}"
+        done
 
         docker run --rm -it --init \
             --network host \
             -e "TERM=${TERM:-xterm-256color}" \
             -e "CLAUDE_SANDBOX=1" \
             -e "LOCAL_MODE=1" \
-            -v "$HOME/.claude:/home/node/.claude" \
-            -v "$HOME/.codex:/home/node/.codex" \
-            -v "$HOME/.ssh:/home/node/.ssh-host:ro" \
             -v "$LOCAL_PATH:/home/node/workspace/$SELECTED_REPO" \
+            ${extra_repo_mounts[@]+"${extra_repo_mounts[@]}"} \
             -e "GIT_USER_NAME=$git_name" \
             -e "GIT_USER_EMAIL=$git_email" \
             "${auth_args[@]}" \
             "${ssh_args[@]}" \
+            "${extra_mounts[@]}" \
+            "${auto_git_args[@]}" \
             "$IMAGE_NAME" \
             "--local" "$SELECTED_REPO"
 
@@ -716,13 +964,12 @@ launch_sandbox() {
             --network host \
             -e "TERM=${TERM:-xterm-256color}" \
             -e "CLAUDE_SANDBOX=1" \
-            -v "$HOME/.claude:/home/node/.claude" \
-            -v "$HOME/.codex:/home/node/.codex" \
-            -v "$HOME/.ssh:/home/node/.ssh-host:ro" \
             -e "GIT_USER_NAME=$git_name" \
             -e "GIT_USER_EMAIL=$git_email" \
             "${auth_args[@]}" \
             "${ssh_args[@]}" \
+            "${extra_mounts[@]}" \
+            "${auto_git_args[@]}" \
             "$IMAGE_NAME" \
             "$SELECTED_REPO_URL"
 
@@ -759,6 +1006,10 @@ screen_main_menu() {
             if [[ -n "$SELECTED_REPO" ]]; then
                 draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Repository${NC}    ${C_TEXT}${SELECTED_REPO}${NC}"
                 draw_box_row $w "  ${C_DIM}  ${NC} ${C_DIM}Path${NC}          ${C_DIM}${LOCAL_PATH}${NC}"
+                for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+                    local ep_name="${ep##*:}"
+                    draw_box_row $w "  ${C_ACCENT}  ${NC} ${C_DIM}+ mounted${NC}     ${C_TEXT}${ep_name}${NC}"
+                done
             else
                 draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Repository${NC}    ${C_DIM}None selected${NC}"
             fi
@@ -822,11 +1073,13 @@ screen_main_menu() {
                 LOCAL_PATH=""
                 SELECTED_REPO=""
                 SELECTED_REPO_URL=""
+                EXTRA_PATHS=()
                 ;;
             "🔄  Switch to Local")
                 LOCAL_MODE=true
                 SELECTED_REPO=""
                 SELECTED_REPO_URL=""
+                EXTRA_PATHS=()
                 screen_local_path
                 ;;
             "👤  Switch Account")
@@ -905,19 +1158,22 @@ detect_current_repo() {
         return
     fi
 
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || return)
+
     local remote_url
     remote_url=$(git remote get-url origin 2>/dev/null || echo "")
 
-    if [[ -z "$remote_url" ]]; then
-        return
-    fi
-
-    # Extract owner/repo
-    local repo_path
-    if [[ "$remote_url" == git@* ]]; then
-        repo_path=$(echo "$remote_url" | sed 's/.*://' | sed 's/\.git$//')
+    # Extract display name (owner/repo if remote exists, else just dirname)
+    local display_name
+    if [[ -n "$remote_url" ]]; then
+        if [[ "$remote_url" == git@* ]]; then
+            display_name=$(echo "$remote_url" | sed 's/.*://' | sed 's/\.git$//')
+        else
+            display_name=$(echo "$remote_url" | sed -E 's|https?://[^/]+/||' | sed 's/\.git$//')
+        fi
     else
-        repo_path=$(echo "$remote_url" | sed -E 's|https?://[^/]+/||' | sed 's/\.git$//')
+        display_name=$(basename "$repo_root")
     fi
 
     local w=56
@@ -929,14 +1185,34 @@ detect_current_repo() {
     draw_box $w "CURRENT DIRECTORY"
     draw_spacer $w
     draw_box_row $w "${C_DIM}  Detected git repository:${NC}"
-    draw_box_row $w "${C_BRIGHT}  ${repo_path}${NC}"
+    draw_box_row $w "${C_BRIGHT}  ${display_name}${NC}"
+    draw_box_row $w "${C_DIM}  ${repo_root}${NC}"
     draw_spacer $w
     draw_box_bottom $w
     echo ""
 
     if gum confirm "Use this repository?"; then
-        SELECTED_REPO="$repo_path"
-        SELECTED_REPO_URL="$remote_url"
+        LOCAL_MODE=true
+        LOCAL_PATH="$repo_root"
+        SELECTED_REPO=$(basename "$repo_root")
+        EXTRA_PATHS=()
+
+        # Offer to mount additional directories
+        while true; do
+            echo ""
+            if ! gum confirm "Mount additional directories?"; then
+                break
+            fi
+
+            local extra_input
+            extra_input=$(gum input --placeholder="Path to another git repo...")
+
+            if [[ -z "$extra_input" ]]; then
+                break
+            fi
+
+            validate_and_add_extra_path "$extra_input" || sleep 1
+        done
     fi
 }
 
@@ -999,6 +1275,15 @@ main() {
 
             SELECTED_REPO=$(basename "$LOCAL_PATH")
             echo -e "  ${C_SUCCESS}${CHECK}${NC} Local repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
+
+            # Process remaining args as extra mounts
+            shift
+            EXTRA_PATHS=()
+            for extra_arg in "$@"; do
+                validate_and_add_extra_path "$extra_arg" || {
+                    echo -e "  ${C_ERROR}${CROSS}${NC} Skipping invalid extra path: ${extra_arg}"
+                }
+            done
 
             if screen_launch_confirm; then
                 launch_sandbox

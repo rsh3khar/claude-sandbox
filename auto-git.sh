@@ -22,13 +22,12 @@ COMMIT_COUNT=0
 while true; do
     sleep "$INTERVAL"
 
-    # Only commit if there are actual changes (excluding sandbox files)
-    if [[ -n $(git status --porcelain -- ':!CLAUDE.md' ':!CLAUDE.md.original') ]]; then
+    # Only commit if there are actual changes
+    if [[ -n $(git status --porcelain) ]]; then
         TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
         COMMIT_COUNT=$((COMMIT_COUNT + 1))
 
-        # Add everything except sandbox files
-        git add -A -- ':!CLAUDE.md' ':!CLAUDE.md.original'
+        git add -A
 
         if git commit -m "auto-save #${COMMIT_COUNT}: ${TIMESTAMP}" --no-verify 2>/dev/null; then
             if [[ -n "$LOCAL_MODE" ]]; then
