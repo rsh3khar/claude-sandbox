@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     ripgrep \
     jq \
     openssh-client \
+    tmux \
     zsh \
     locales \
     sudo \
@@ -92,6 +93,11 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 # Use @latest to ensure newest version on each build
 USER root
 RUN npm install -g @openai/codex@latest
+
+# Playwright env vars (browser installed on-demand via entrypoint when ENABLE_BROWSER is set)
+ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/playwright
+ENV PLAYWRIGHT_CHROMIUM_SANDBOX=0
+
 USER node
 
 # Add claude to PATH
@@ -105,6 +111,7 @@ WORKDIR /home/node/workspace
 USER root
 COPY auto-git.sh /usr/local/bin/auto-git
 COPY entrypoint.sh /entrypoint.sh
+COPY sandbox-context.md /usr/local/share/sandbox-context.md
 RUN chmod +x /usr/local/bin/auto-git /entrypoint.sh
 
 # Switch back to node user

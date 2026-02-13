@@ -24,12 +24,44 @@ C_DIM=$'\033[38;2;120;113;108m'
 C_TEXT=$'\033[38;2;214;211;209m'
 C_ACCENT=$'\033[38;2;217;119;6m'
 C_SUCCESS=$'\033[38;2;34;197;94m'
+C_WARN=$'\033[38;2;234;179;8m'
 NC=$'\033[0m'
 BOLD=$'\033[1m'
+
+# Spinner for long-running tasks
+# Usage: run_with_spinner "message" command arg1 arg2 ...
+run_with_spinner() {
+    local msg="$1"
+    shift
+    local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+    local i=0
+
+    "$@" >/dev/null 2>&1 &
+    local pid=$!
+
+    tput civis 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r  ${C_ACCENT}${frames[$i]}${NC} ${C_DIM}${msg}${NC}  "
+        i=$(( (i + 1) % ${#frames[@]} ))
+        sleep 0.08
+    done
+    tput cnorm 2>/dev/null || true
+
+    wait "$pid"
+    local exit_code=$?
+    printf "\r%60s\r" ""
+    return $exit_code
+}
 
 echo ""
 echo -e "${C_ACCENT}${BOLD}◈ CLAUDE SANDBOX${NC}"
 echo ""
+
+# Open up container-local permissions — it's a sandbox, no friction.
+# SKIP host mounts: ~/.claude, ~/.aws, ~/.config/gh, ~/.codex, ~/.agents, ~/.ssh-host
+sudo chmod -R 777 /home/node/workspace 2>/dev/null || true
+sudo chmod -R 777 /usr/local/share/playwright 2>/dev/null || true
+sudo chmod -R 777 /tmp 2>/dev/null || true
 
 # Fix SSH socket permissions (Docker Desktop or OrbStack)
 if [[ -S "/run/host-services/ssh-auth.sock" ]]; then
@@ -90,6 +122,129 @@ fi
 # Configure git identity
 [[ -n "${GIT_USER_NAME:-}" ]] && git config user.name "$GIT_USER_NAME"
 [[ -n "${GIT_USER_EMAIL:-}" ]] && git config user.email "$GIT_USER_EMAIL"
+
+# Inject sandbox context for Claude Code and Codex
+# Place it in the workspace root (parent of repo) so it's picked up
+# without touching any repo files. Claude Code walks parent dirs for CLAUDE.md.
+SANDBOX_CTX="/usr/local/share/sandbox-context.md"
+if [[ -f "$SANDBOX_CTX" ]]; then
+    cp "$SANDBOX_CTX" ~/workspace/CLAUDE.md
+    cp "$SANDBOX_CTX" ~/workspace/AGENTS.md
+fi
+
+# Install & configure Playwright + Chromium (only when browser is enabled)
+if [[ -n "${ENABLE_BROWSER:-}" ]]; then
+    echo -e "${C_DIM}Setting up browser...${NC}"
+
+    # System dependencies (always needed — container is fresh each time, but fast)
+    if run_with_spinner "Installing system dependencies" sudo npx -y playwright install-deps chromium; then
+        echo -e "  ${C_SUCCESS}✓${NC} System dependencies"
+    else
+        echo -e "  ${C_WARN}⚠${NC} System dependencies failed"
+    fi
+
+    # Chromium binary (cached in Docker volume — skips download if already present)
+    browser_path="${PLAYWRIGHT_BROWSERS_PATH:-/usr/local/share/playwright}"
+    if ls "$browser_path"/chromium-*/chrome-linux/chrome >/dev/null 2>&1; then
+        echo -e "  ${C_SUCCESS}✓${NC} Chromium ${C_DIM}(cached)${NC}"
+    else
+        if run_with_spinner "Downloading Chromium (first time only)" bash -c "sudo npx -y playwright install chromium"; then
+            echo -e "  ${C_SUCCESS}✓${NC} Chromium installed"
+        else
+            echo -e "  ${C_WARN}⚠${NC} Chromium install failed"
+        fi
+    fi
+
+    # Python Playwright client (small, always needed since container is fresh)
+    if run_with_spinner "Setting up Python Playwright" pip3 install --break-system-packages playwright; then
+        echo -e "  ${C_SUCCESS}✓${NC} Python Playwright"
+    else
+        echo -e "  ${C_WARN}⚠${NC} Python Playwright failed"
+    fi
+
+    # Install MCP server globally so it shares the same browser
+    if run_with_spinner "Setting up Playwright MCP" sudo npm install -g @playwright/mcp@latest; then
+        echo -e "  ${C_SUCCESS}✓${NC} Playwright MCP"
+    else
+        echo -e "  ${C_WARN}⚠${NC} Playwright MCP failed"
+    fi
+
+    echo ""
+
+    # Write project-level .mcp.json so Claude Code auto-discovers it
+    # Exclude from git so auto-git doesn't commit it
+    echo '.mcp.json' >> .git/info/exclude 2>/dev/null || true
+
+    if [ -f .mcp.json ]; then
+        # Repo already has .mcp.json — merge playwright into it
+        python3 -c "
+import json
+with open('.mcp.json') as f: cfg = json.load(f)
+cfg.setdefault('mcpServers', {})
+cfg['mcpServers']['playwright'] = {'command':'playwright-mcp','args':['--headless','--browser','chromium']}
+with open('.mcp.json','w') as f: json.dump(cfg, f, indent=2)
+" 2>/dev/null || true
+    else
+        cat > .mcp.json << 'MCPEOF'
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "playwright-mcp",
+      "args": ["--headless", "--browser", "chromium"]
+    }
+  }
+}
+MCPEOF
+    fi
+fi
+
+# Update CLI tools if requested
+if [[ -n "${UPDATE_TOOLS:-}" ]]; then
+    echo -e "${C_DIM}Checking for updates...${NC}"
+
+    # Claude Code
+    CLAUDE_CURRENT=$(claude --version 2>/dev/null || echo "")
+    CLAUDE_LATEST=$(curl -fsSL https://claude.ai/install.sh 2>/dev/null | grep -o 'VERSION="[^"]*"' | head -1 | cut -d'"' -f2 || echo "")
+    if [[ -n "$CLAUDE_CURRENT" && "$CLAUDE_CURRENT" == *"$CLAUDE_LATEST"* && -n "$CLAUDE_LATEST" ]]; then
+        echo -e "  ${C_SUCCESS}✓${NC} Claude Code ${C_DIM}(${CLAUDE_CURRENT}, latest)${NC}"
+    else
+        if run_with_spinner "Updating Claude Code" bash -c "curl -fsSL https://claude.ai/install.sh | bash"; then
+            echo -e "  ${C_SUCCESS}✓${NC} Claude Code updated"
+        else
+            echo -e "  ${C_WARN}⚠${NC} Claude Code update failed"
+        fi
+    fi
+
+    # Codex
+    CODEX_CURRENT=$(npm list -g @openai/codex --json 2>/dev/null | jq -r '.dependencies["@openai/codex"].version // empty' 2>/dev/null)
+    CODEX_LATEST=$(npm view @openai/codex@latest version 2>/dev/null || echo "")
+    if [[ -n "$CODEX_CURRENT" && "$CODEX_CURRENT" == "$CODEX_LATEST" ]]; then
+        echo -e "  ${C_SUCCESS}✓${NC} Codex ${C_DIM}(${CODEX_CURRENT}, latest)${NC}"
+    else
+        if run_with_spinner "Updating Codex" sudo npm install -g @openai/codex@latest; then
+            echo -e "  ${C_SUCCESS}✓${NC} Codex updated"
+        else
+            echo -e "  ${C_WARN}⚠${NC} Codex update failed"
+        fi
+    fi
+
+    # Playwright (only if browser enabled)
+    if [[ -n "${ENABLE_BROWSER:-}" ]]; then
+        PW_CURRENT=$(npx playwright --version 2>/dev/null || echo "")
+        PW_LATEST=$(npm view playwright@latest version 2>/dev/null || echo "")
+        if [[ -n "$PW_CURRENT" && "$PW_CURRENT" == *"$PW_LATEST"* && -n "$PW_LATEST" ]]; then
+            echo -e "  ${C_SUCCESS}✓${NC} Playwright ${C_DIM}(${PW_CURRENT}, latest)${NC}"
+        else
+            if run_with_spinner "Updating Playwright" sudo npx -y playwright install chromium; then
+                echo -e "  ${C_SUCCESS}✓${NC} Playwright updated"
+            else
+                echo -e "  ${C_WARN}⚠${NC} Playwright update failed"
+            fi
+        fi
+    fi
+
+    echo ""
+fi
 
 # Function to show branch menu
 show_branch_menu() {
@@ -322,7 +477,60 @@ fi
 echo ""
 echo -e "  ${C_DIM}Type ${C_TEXT}c${C_DIM} or ${C_TEXT}claude${C_DIM} for Claude Code${NC}"
 echo -e "  ${C_DIM}Type ${C_TEXT}x${C_DIM} or ${C_TEXT}codex${C_DIM} for OpenAI Codex${NC}"
+if [[ -n "${ENABLE_BROWSER:-}" ]]; then
+    echo -e "  ${C_DIM}Browser: ${C_TEXT}Chromium (headless)${C_DIM} via Playwright${NC}"
+else
+    echo -e "  ${C_DIM}Browser: ${C_TEXT}disabled${C_DIM} (restart with browser option to enable)${NC}"
+fi
 echo -e "  ${C_DIM}Screenshots: save to ${C_TEXT}~/.claude/screenshots/${C_DIM} on host${NC}"
+
+# Skills summary
+CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
+CODEX_SKILLS_DIR="$HOME/.agents/skills"
+CLAUDE_SKILL_COUNT=0
+CODEX_SKILL_COUNT=0
+
+if [[ -d "$CLAUDE_SKILLS_DIR" ]]; then
+    CLAUDE_SKILL_COUNT=$(ls -1d "$CLAUDE_SKILLS_DIR"/*/ 2>/dev/null | wc -l | tr -d ' ')
+fi
+if [[ -d "$CODEX_SKILLS_DIR" ]]; then
+    CODEX_SKILL_COUNT=$(ls -1d "$CODEX_SKILLS_DIR"/*/ 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+TOTAL_SKILLS=$((CLAUDE_SKILL_COUNT + CODEX_SKILL_COUNT))
+
+if [[ "$TOTAL_SKILLS" -gt 0 ]]; then
+    SKILL_PARTS=""
+    if [[ "$CLAUDE_SKILL_COUNT" -gt 0 ]]; then
+        CLAUDE_NAMES=$(ls -1d "$CLAUDE_SKILLS_DIR"/*/ 2>/dev/null | xargs -I{} basename {} | head -4 | paste -sd ", " -)
+        SKILL_PARTS="Claude: ${CLAUDE_SKILL_COUNT} (${CLAUDE_NAMES})"
+    fi
+    if [[ "$CODEX_SKILL_COUNT" -gt 0 ]]; then
+        CODEX_NAMES=$(ls -1d "$CODEX_SKILLS_DIR"/*/ 2>/dev/null | xargs -I{} basename {} | head -4 | paste -sd ", " -)
+        if [[ -n "$SKILL_PARTS" ]]; then
+            SKILL_PARTS="${SKILL_PARTS} | Codex: ${CODEX_SKILL_COUNT} (${CODEX_NAMES})"
+        else
+            SKILL_PARTS="Codex: ${CODEX_SKILL_COUNT} (${CODEX_NAMES})"
+        fi
+    fi
+    echo -e "  ${C_DIM}Skills: ${C_TEXT}${SKILL_PARTS}${NC}"
+else
+    echo ""
+    echo -e "  ${C_ACCENT}No skills installed.${NC}"
+    echo -e "  ${C_DIM}Skills add capabilities like web testing, code review, deployment, etc.${NC}"
+    echo -e "  ${C_DIM}Browse: ${C_TEXT}https://skills.sh${NC}"
+    echo -e "  ${C_DIM}Claude:  ${C_TEXT}npx skills add <owner/repo>${NC}"
+    echo -e "  ${C_DIM}Codex:   ${C_TEXT}skill-installer install <name> from <source>${NC}"
+    echo ""
+    read -p "  Install popular skills now? [y/N]: " INSTALL_SKILLS
+    if [[ "$INSTALL_SKILLS" == "y" || "$INSTALL_SKILLS" == "Y" ]]; then
+        echo ""
+        npx -y skills add anthropics/claude-code-skills 2>/dev/null \
+            && echo -e "  ${C_SUCCESS}✓${NC} Claude skills installed" \
+            || echo -e "  ${C_ACCENT}⚠${NC} Claude skills install failed"
+    fi
+fi
+
 echo ""
 echo -e "${C_DIM}─────────────────────────────────────────${NC}"
 echo ""

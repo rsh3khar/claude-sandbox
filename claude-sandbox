@@ -47,6 +47,8 @@ GH_USER_DATA=""
 LOCAL_MODE=false
 LOCAL_PATH=""
 AUTO_GIT=true
+BROWSER=false
+UPDATE_TOOLS=false
 EXTRA_PATHS=()   # Additional local directories to mount
 
 IMAGE_NAME="claude-sandbox"
@@ -735,6 +737,16 @@ screen_launch_confirm() {
         else
             draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}Auto-save disabled${NC}"
         fi
+        if [[ "$BROWSER" == true ]]; then
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Headless browser (Chromium)${NC}"
+        else
+            draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Headless browser disabled${NC}"
+        fi
+        if [[ "$UPDATE_TOOLS" == true ]]; then
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Update CLI tools on start${NC}"
+        else
+            draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}CLI tools update skipped${NC}"
+        fi
         draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}No push to remote${NC}"
         draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
         draw_spacer $w
@@ -755,6 +767,16 @@ screen_launch_confirm() {
         else
             draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}Auto-save disabled${NC}"
         fi
+        if [[ "$BROWSER" == true ]]; then
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Headless browser (Chromium)${NC}"
+        else
+            draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Headless browser disabled${NC}"
+        fi
+        if [[ "$UPDATE_TOOLS" == true ]]; then
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Update CLI tools on start${NC}"
+        else
+            draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}CLI tools update skipped${NC}"
+        fi
         draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
         draw_spacer $w
         draw_box_bottom $w
@@ -768,6 +790,18 @@ screen_launch_confirm() {
         AUTO_GIT=true
     else
         AUTO_GIT=false
+    fi
+
+    if gum confirm "Enable headless browser (Playwright)?"; then
+        BROWSER=true
+    else
+        BROWSER=false
+    fi
+
+    if gum confirm "Update CLI tools on start?"; then
+        UPDATE_TOOLS=true
+    else
+        UPDATE_TOOLS=false
     fi
 
     echo ""
@@ -905,6 +939,11 @@ launch_sandbox() {
     if [[ -d "$HOME/.codex" ]]; then
         extra_mounts+=("-v" "$HOME/.codex:/home/node/.codex")
     fi
+
+    # Codex skills directory (only if exists)
+    if [[ -d "$HOME/.agents" ]]; then
+        extra_mounts+=("-v" "$HOME/.agents:/home/node/.agents")
+    fi
     local gh_token
     gh_token=$(cat "$gh_tmpfile" 2>/dev/null | tr -d '\n' || echo "")
     rm -f "$gh_tmpfile"
@@ -924,6 +963,24 @@ launch_sandbox() {
         echo -e "  ${C_SUCCESS}${CHECK}${NC} Auto-save enabled"
     fi
 
+    # Browser toggle
+    local browser_args=()
+    if [[ "$BROWSER" == true ]]; then
+        browser_args+=("--shm-size=256m" "-e" "ENABLE_BROWSER=1")
+        # Named volume caches Chromium binary across sessions
+        browser_args+=("-v" "claude-sandbox-browser:/usr/local/share/playwright")
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Headless browser enabled"
+    else
+        echo -e "  ${C_DIM}${RING}${NC} Browser disabled"
+    fi
+
+    # Update tools toggle
+    local update_args=()
+    if [[ "$UPDATE_TOOLS" == true ]]; then
+        update_args+=("-e" "UPDATE_TOOLS=1")
+        echo -e "  ${C_SUCCESS}${CHECK}${NC} Will update tools on start"
+    fi
+
     if [[ "$LOCAL_MODE" == true ]]; then
         # Local mode: bind mount the repo, pass --local flag
         echo -e "  ${C_SUCCESS}${CHECK}${NC} Local mode: mounting ${LOCAL_PATH}"
@@ -939,6 +996,7 @@ launch_sandbox() {
 
         docker run --rm -it --init \
             --network host \
+            ${browser_args[@]+"${browser_args[@]}"} \
             -e "TERM=${TERM:-xterm-256color}" \
             -e "CLAUDE_SANDBOX=1" \
             -e "LOCAL_MODE=1" \
@@ -950,6 +1008,7 @@ launch_sandbox() {
             "${ssh_args[@]}" \
             "${extra_mounts[@]}" \
             "${auto_git_args[@]}" \
+            ${update_args[@]+"${update_args[@]}"} \
             "$IMAGE_NAME" \
             "--local" "$SELECTED_REPO"
 
@@ -962,6 +1021,7 @@ launch_sandbox() {
         # GitHub mode: clone from URL
         docker run --rm -it --init \
             --network host \
+            ${browser_args[@]+"${browser_args[@]}"} \
             -e "TERM=${TERM:-xterm-256color}" \
             -e "CLAUDE_SANDBOX=1" \
             -e "GIT_USER_NAME=$git_name" \
@@ -970,6 +1030,7 @@ launch_sandbox() {
             "${ssh_args[@]}" \
             "${extra_mounts[@]}" \
             "${auto_git_args[@]}" \
+            ${update_args[@]+"${update_args[@]}"} \
             "$IMAGE_NAME" \
             "$SELECTED_REPO_URL"
 
@@ -1042,6 +1103,7 @@ screen_main_menu() {
             fi
             options+=("📂  Select Directory")
             options+=("🔄  Switch to GitHub")
+            options+=("🔧  Rebuild Image")
             options+=("❌  Exit")
         else
             if [[ -n "$SELECTED_REPO" && -n "$GH_USER" ]]; then
@@ -1050,6 +1112,7 @@ screen_main_menu() {
             options+=("📂  Select Repository")
             options+=("🔄  Switch to Local")
             options+=("👤  Switch Account")
+            options+=("🔧  Rebuild Image")
             options+=("❌  Exit")
         fi
 
@@ -1084,6 +1147,19 @@ screen_main_menu() {
                 ;;
             "👤  Switch Account")
                 screen_switch_account
+                ;;
+            "🔧  Rebuild Image")
+                echo ""
+                echo -e "  ${C_ACCENT}${BULLET}${NC} ${C_TEXT}Rebuilding sandbox image (no cache)...${NC}"
+                echo ""
+                docker build --no-cache -t "$IMAGE_NAME" "$SCRIPT_DIR" 2>&1 | while read -r line; do
+                    echo -e "    ${C_DIM}${line}${NC}"
+                done
+                echo ""
+                echo -e "  ${C_SUCCESS}${CHECK}${NC} Image rebuilt with latest versions"
+                echo ""
+                echo -e "  ${C_DIM}Press Enter to continue...${NC}"
+                read -r
                 ;;
             "❌  Exit")
                 clear
