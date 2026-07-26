@@ -1238,3 +1238,37 @@ setup() {
     run screen_launch_confirm
     [ "$status" -eq 0 ]
 }
+
+# ── Dependencies are required only when used ────────────────────────────────
+
+@test "dry-run does not require gum" {
+    DRY_RUN=true; ASSUME_YES=true; EXEC_PROMPT=""
+    command -v() { [[ "$1" == "docker" ]]; }   # only docker present
+    run check_deps
+    [ "$status" -eq 0 ]
+}
+
+@test "exec does not require gum" {
+    DRY_RUN=false; ASSUME_YES=false; EXEC_PROMPT="do a thing"
+    command -v() { [[ "$1" == "docker" ]]; }
+    run check_deps
+    [ "$status" -eq 0 ]
+}
+
+@test "interactive use does require gum" {
+    DRY_RUN=false; ASSUME_YES=false; EXEC_PROMPT=""
+    command -v() { [[ "$1" == "docker" ]]; }
+    clear_screen() { :; }
+    run check_deps
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"gum"* ]]
+}
+
+@test "docker is always required" {
+    DRY_RUN=true; ASSUME_YES=true; EXEC_PROMPT=""
+    command -v() { return 1; }
+    clear_screen() { :; }
+    run check_deps
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"docker"* ]]
+}

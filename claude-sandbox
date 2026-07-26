@@ -2763,12 +2763,19 @@ detect_current_repo() {
 # │ Dependencies                                                            │
 # └─────────────────────────────────────────────────────────────────────────┘
 
+# Only demand what the requested operation actually uses.
+#
+# docker is always required. gum draws the interactive prompts, so it is not
+# needed for --dry-run, -y, or `exec`. gh and jq only matter for GitHub mode —
+# a purely local session should not require a GitHub login to exist, and CI
+# should be able to run `--dry-run` without installing a TUI toolkit.
 check_deps() {
     local missing=()
     command -v docker &>/dev/null || missing+=("docker")
-    command -v gh &>/dev/null || missing+=("gh")
-    command -v gum &>/dev/null || missing+=("gum")
-    command -v jq &>/dev/null || missing+=("jq")
+
+    if [[ "$DRY_RUN" != true && "$ASSUME_YES" != true && -z "$EXEC_PROMPT" ]]; then
+        command -v gum &>/dev/null || missing+=("gum")
+    fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         clear_screen
@@ -2783,6 +2790,11 @@ check_deps() {
         echo -e "  ${C_DIM}Install with: ${C_TEXT}brew install ${missing[*]}${NC}"
         echo ""
         exit 1
+    fi
+
+    # GitHub mode degrades rather than blocking
+    if [[ "$LOCAL_MODE" != true ]] && ! command -v gh &>/dev/null; then
+        say_warn "${C_DIM}gh not installed — GitHub repositories are unavailable${NC}"
     fi
 }
 
