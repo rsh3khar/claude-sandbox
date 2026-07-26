@@ -163,6 +163,7 @@ if [[ "$wt_rc" -ne 0 ]]; then
 fi
 
 if [[ -n "$wtdir" ]]; then
+wt_rc2=0
 wt_out=$(docker run --rm \
     -v "$wtdir/tree:/home/node/workspace/proj" \
     -v "$wtdir/main/.git:$wtdir/main/.git" \
@@ -172,7 +173,8 @@ wt_out=$(docker run --rm \
         git add -A
         git -c user.email=t@t -c user.name=t commit -qm "from sandbox" >/dev/null
         git branch --show-current
-    ' 2>&1)
+    ' 2>&1) || wt_rc2=$?
+printf "  … worktree container rc=%s\n" "$wt_rc2"
 
 if [[ "$wt_out" == "agent-work" ]]; then
     # The commit must be visible from the main repo, and main must stay clean

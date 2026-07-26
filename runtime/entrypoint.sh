@@ -166,6 +166,13 @@ else
     cd ~/workspace/"$REPO_NAME"
 fi
 
+# Bind-mounted repositories frequently belong to a different uid than the
+# container's node user — any Linux host whose user is not uid 1000, and every
+# CI runner. git refuses to touch those at all ("detected dubious ownership",
+# exit 128), which breaks every git operation in the sandbox. The container is
+# disposable and everything in it is the user's own code, so trust all of it.
+git config --global --add safe.directory '*' 2>/dev/null || true
+
 # Git identity from host
 [[ -n "${GIT_USER_NAME:-}" ]] && git config user.name "$GIT_USER_NAME"
 [[ -n "${GIT_USER_EMAIL:-}" ]] && git config user.email "$GIT_USER_EMAIL"
