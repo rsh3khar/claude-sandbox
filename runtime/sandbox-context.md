@@ -5,24 +5,45 @@ You are running inside **Claude Sandbox** - an isolated Docker container.
 ## Key Facts
 
 - You have `--dangerously-skip-permissions` enabled (no approval prompts)
-- Changes auto-commit to GitHub every 60 seconds
 - Container is destroyed on exit - the host machine is safe
 - Network is shared with host (all ports work)
+- Auto-save is **opt-in** and usually off. Do not assume your work is being
+  committed for you - commit deliberately, like you would anywhere else.
 
 ## What You Can Do
 
 - Run any command without asking for permission
 - Install packages, run builds, start servers
 - Make breaking changes freely - the sandbox is disposable
-- Access any file in the cloned repo
+- Access any file in the mounted folders
 
 ## Paths
 
 | Location | Path |
 |----------|------|
-| Repo | `~/workspace/<repo-name>/` |
+| Primary repo | `~/workspace/<repo-name>/` |
+| Extra mounts | `~/workspace/<other-name>/` |
 | Shared config | `~/.claude/` (mounted from host) |
 | Screenshots | `~/.claude/screenshots/` |
+
+## Mounted Folders
+
+The session may mount several folders side by side under `~/workspace/`. The
+startup banner lists each one with its branch and whether it has uncommitted
+changes. Some may be:
+
+- **read-only** - mounted with `:ro`; treat them as reference material
+- **not git repositories** - notes, data, or assets; no branches there
+
+Each git repo has its own branch and history. Committing in one does not
+affect the others.
+
+## Worktree Mode
+
+If the session was launched with `--worktree`, the repo you see is a **git
+worktree on a scratch branch**, not the user's working tree. Their checkout is
+untouched, and your commits land in their repository for review. Commit
+normally; the user merges the branch afterwards on the host.
 
 ## Screenshots / Images
 
@@ -79,9 +100,15 @@ The `webapp-testing` skill has helper scripts for managing server lifecycle — 
 
 ## Auto-Save
 
-- Changes commit every 60 seconds (only when changes exist)
-- On exit: final commit with message "wip: session end"
-- Check logs: `cat /tmp/auto-git.log`
+**Off by default.** When the user enables it (`--auto-git`):
+
+- Commits every N seconds, only when there are actual changes
+- Skipped during a merge, rebase, cherry-pick, or on a detached HEAD
+- On exit: a final commit with message "wip: session end"
+- Check whether it is running: `cat /tmp/auto-git.log`
+
+Only the primary repo is watched. Changes in extra mounted folders are yours
+to commit.
 
 ## Skills
 
@@ -164,9 +191,11 @@ Each agent works on its own branch in its own directory. Merge when done.
 
 ## Environment Notes
 
-- **Python**: System Python 3 with pip. Do NOT use conda — it is not available in the container.
-- **pip**: `pip install <package>` works directly (no flags needed)
-- **Pre-installed**: boto3, requests, jq
+- **Python**: a virtualenv at `/opt/venv`, first on `PATH`. Do NOT use conda — it is not available in the container.
+- **pip**: `pip install <package>` works directly (no flags, no `--break-system-packages`)
+- **uv**: available and much faster — `uv pip install <package>` works in the same venv
+- **Node**: v24 LTS, with `build-essential` present so native modules compile
+- **Pre-installed**: boto3, requests, jq, ripgrep (`rg`), fd, tmux
 - **AWS**: If credentials fail, tell the user to run `aws sso login` on the HOST machine, then retry inside the container
 - The global `~/.claude/CLAUDE.md` may reference conda environments — ignore those instructions inside the sandbox
 

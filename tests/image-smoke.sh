@@ -101,6 +101,72 @@ else
 fi
 rm -rf "$workdir"
 
+# ── Headless exec: stdout must carry agent output and nothing else ───────────
+execdir="$(mktemp -d)"
+mkdir -p "$execdir/repo" "$execdir/fake"
+cat > "$execdir/fake/claude" <<'FAKE'
+#!/bin/bash
+echo "AGENT_OUTPUT_MARKER"
+FAKE
+chmod +x "$execdir/fake/claude"
+(
+    cd "$execdir/repo"
+    git init -q
+    git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+) >/dev/null 2>&1
+
+exec_out=$(docker run --rm -i \
+    -e "SANDBOX_EXEC=test prompt" -e "SANDBOX_AGENT=claude" -e "LOCAL_MODE=1" \
+    -v "$execdir/repo:/home/node/workspace/repo" \
+    -v "$execdir/fake/claude:/opt/venv/bin/claude:ro" \
+    "$IMAGE" --local repo 2>/dev/null)
+
+if [[ "$exec_out" == "AGENT_OUTPUT_MARKER" ]]; then
+    ok "headless exec puts only agent output on stdout"
+else
+    bad "headless exec stdout polluted: $(echo "$exec_out" | head -3 | tr '\n' '|')"
+fi
+rm -rf "$execdir"
+
+# ── Worktree mode: git must be fully functional inside the container ─────────
+wtdir="$(cd "$(mktemp -d)" && pwd -P)"   # resolve symlinked /var on macOS
+(
+    cd "$wtdir"
+    mkdir main
+    cd main
+    git init -q
+    echo hi > a.txt
+    git add -A
+    git -c user.email=t@t -c user.name=t commit -qm init
+    git worktree add -q "$wtdir/tree" -b agent-work
+) >/dev/null 2>&1
+
+wt_out=$(docker run --rm \
+    -v "$wtdir/tree:/home/node/workspace/proj" \
+    -v "$wtdir/main/.git:$wtdir/main/.git" \
+    --entrypoint bash "$IMAGE" -c '
+        cd /home/node/workspace/proj
+        echo new > b.txt
+        git add -A
+        git -c user.email=t@t -c user.name=t commit -qm "from sandbox" >/dev/null
+        git branch --show-current
+    ' 2>&1)
+
+if [[ "$wt_out" == "agent-work" ]]; then
+    # The commit must be visible from the main repo, and main must stay clean
+    host_log=$(git -C "$wtdir/main" log --oneline agent-work 2>/dev/null | head -1)
+    host_dirty=$(git -C "$wtdir/main" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$host_log" == *"from sandbox"* && "$host_dirty" == "0" ]]; then
+        ok "worktree mode: commits reach the host repo, checkout stays clean"
+    else
+        bad "worktree mode: host repo did not receive the commit (log='$host_log', dirty=$host_dirty)"
+    fi
+else
+    bad "worktree mode: git broken inside container ($wt_out)"
+fi
+git -C "$wtdir/main" worktree remove --force "$wtdir/tree" >/dev/null 2>&1 || true
+rm -rf "$wtdir"
+
 # ── Entrypoint sanity ────────────────────────────────────────────────────────
 check "entrypoint is executable"  "OK" "$(in_image 'test -x /entrypoint.sh && echo OK')"
 check "entrypoint parses"         "OK" "$(in_image 'bash -n /entrypoint.sh && echo OK')"

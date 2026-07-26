@@ -71,6 +71,12 @@ run_with_spinner() {
     return $exit_code
 }
 
+# In headless mode, keep fd 3 as the real stdout and send all setup chatter to
+# stderr, so `cs exec` output is exactly the agent's answer and nothing else.
+if [[ -n "${SANDBOX_EXEC:-}" ]]; then
+    exec 3>&1 1>&2
+fi
+
 echo ""
 echo -e "${C_ACCENT}${BOLD}◈ CLAUDE SANDBOX${NC}"
 echo ""
@@ -258,6 +264,21 @@ if [[ -n "${UPDATE_TOOLS:-}" ]]; then
     fi
 
     echo ""
+fi
+
+# ── Headless one-shot run ────────────────────────────────────────────────────
+# No branch menu, no auto-save daemon, no shell: run the agent and exit with
+# its status. Agent output goes to the real stdout via fd 3.
+if [[ -n "${SANDBOX_EXEC:-}" ]]; then
+    echo -e "${C_DIM}Running ${SANDBOX_AGENT:-claude} headlessly in ${REPO_NAME}...${NC}"
+    case "${SANDBOX_AGENT:-claude}" in
+        codex)
+            exec codex exec --dangerously-bypass-approvals-and-sandbox "$SANDBOX_EXEC" >&3
+            ;;
+        *)
+            exec claude --dangerously-skip-permissions -p "$SANDBOX_EXEC" >&3
+            ;;
+    esac
 fi
 
 # ── Branch selection ─────────────────────────────────────────────────────────
@@ -485,6 +506,34 @@ echo -e "${C_DIM}─────────────────────
 echo ""
 echo -e "  ${C_TEXT}Repo:${NC}       ${C_ACCENT}${REPO_NAME}${NC}"
 echo -e "  ${C_TEXT}Branch:${NC}     ${C_ACCENT}$(git branch --show-current)${NC}"
+
+# Additional mounted folders: show each one's branch and dirty state, so the
+# state of a multi-repo session is obvious at a glance.
+EXTRA_DIRS=()
+while IFS= read -r d; do
+    [[ -n "$d" ]] && EXTRA_DIRS+=("$d")
+done < <(find ~/workspace -mindepth 1 -maxdepth 1 -type d ! -name "$REPO_NAME" 2>/dev/null | sort)
+
+if [[ ${#EXTRA_DIRS[@]} -gt 0 ]]; then
+    echo ""
+    echo -e "  ${C_TEXT}Also mounted:${NC}"
+    for d in "${EXTRA_DIRS[@]}"; do
+        name=$(basename "$d")
+        if [[ -e "$d/.git" ]]; then
+            br=$(git -C "$d" branch --show-current 2>/dev/null || echo "?")
+            dirty=$(git -C "$d" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+            if [[ "$dirty" != "0" ]]; then
+                echo -e "    ${C_ACCENT}${name}${NC} ${C_DIM}(${br}, ${dirty} uncommitted)${NC}"
+            else
+                echo -e "    ${C_ACCENT}${name}${NC} ${C_DIM}(${br})${NC}"
+            fi
+        else
+            writable="read-only"
+            [[ -w "$d" ]] && writable="writable"
+            echo -e "    ${C_ACCENT}${name}${NC} ${C_DIM}(no git, ${writable})${NC}"
+        fi
+    done
+fi
 if [[ -n "$LOCAL_MODE" ]]; then
     echo -e "  ${C_TEXT}Mode:${NC}       ${C_WARN}Local${NC} ${C_DIM}(no push)${NC}"
 fi

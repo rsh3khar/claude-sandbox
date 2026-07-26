@@ -73,7 +73,8 @@ test:
 ifdef BATS
 	@bats tests/unit
 else
-	@$(DOCKER_RUN) bats/bats:latest tests/unit
+	@$(DOCKER_RUN) --entrypoint sh bats/bats:latest -c \
+		'apk add --no-cache git >/dev/null 2>&1; exec bats tests/unit'
 endif
 
 ## test-image: Smoke-test the built image (needs a built image)
@@ -82,9 +83,13 @@ test-image: build
 	@echo "==> image smoke tests"
 	@IMAGE=$(IMAGE) ./tests/image-smoke.sh
 
-## check: lint + fmt-check + test
+## check: lint + test (run before pushing)
 .PHONY: check
-check: lint fmt-check test
+check: lint test
+# fmt-check is deliberately not part of `check` or CI. This codebase aligns
+# case arms and box-drawing calls into columns on purpose, and shfmt collapses
+# that. shellcheck is what catches real defects; formatting stays a judgement
+# call. `make fmt` is here if you want it.
 
 ## build: Build the sandbox image locally
 .PHONY: build

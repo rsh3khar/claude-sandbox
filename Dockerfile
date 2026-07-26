@@ -6,8 +6,12 @@
 # Build:  docker buildx build -t claude-sandbox .
 # Args:   NODE_VERSION, DEBIAN_SUITE, CLAUDE_CODE_VERSION, CODEX_VERSION
 
+# bookworm-slim, not bookworm: the full node image bundles buildpack-deps
+# (subversion, mercurial, every -dev header) for ~880MB that agents never use.
+# build-essential is installed explicitly below, so native npm modules still
+# compile. Measured: 2.24GB -> 1.71GB.
 ARG NODE_VERSION=24
-ARG DEBIAN_SUITE=bookworm
+ARG DEBIAN_SUITE=bookworm-slim
 
 FROM node:${NODE_VERSION}-${DEBIAN_SUITE}
 
@@ -33,6 +37,7 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean \
 RUN --mount=type=cache,id=apt-cache-${TARGETARCH},target=/var/cache/apt,sharing=locked \
     --mount=type=cache,id=apt-lib-${TARGETARCH},target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     ca-certificates \
     curl \
     fd-find \
@@ -43,6 +48,7 @@ RUN --mount=type=cache,id=apt-cache-${TARGETARCH},target=/var/cache/apt,sharing=
     less \
     locales \
     openssh-client \
+    procps \
     python3 \
     python3-venv \
     ripgrep \

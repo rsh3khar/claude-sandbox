@@ -55,7 +55,7 @@ setup() {
     [ "$(resolve_mount_name 'web')" = "web" ]
     [ "$(resolve_mount_name 'api')" = "api-2" ]
 
-    EXTRA_PATHS=("/x/web:web")
+    EXTRA_PATHS=("/x/web|web|rw")
     [ "$(resolve_mount_name 'web')" = "web-2" ]
 }
 
@@ -135,7 +135,7 @@ setup() {
     SELECTED_REPO="myrepo"
     IMAGE_REF="claude-sandbox"
     CONTAINER_NAME="cs-test"      # avoids the docker ps lookup
-    EXTRA_PATHS=("/tmp/other:other")
+    EXTRA_PATHS=("/tmp/other|other|rw")
     AUTO_GIT=true
     BROWSER=false
 
@@ -196,7 +196,381 @@ setup() {
 @test "help output lists every subcommand" {
     run show_help
     [ "$status" -eq 0 ]
-    for cmd in run ps attach kill orphans doctor update version help; do
+    for cmd in run exec ps attach kill orphans worktrees doctor update version help; do
         [[ "$output" == *"$cmd"* ]]
     done
+}
+
+# ── Local-mode mounts ────────────────────────────────────────────────────────
+
+@test "mount accessors split the pipe-delimited entry" {
+    local entry="/a/b c:d|name|ro"
+    [ "$(mount_path "$entry")" = "/a/b c:d" ]
+    [ "$(mount_name "$entry")" = "name" ]
+    [ "$(mount_mode "$entry")" = "ro" ]
+}
+
+@test "validate_and_add_extra_path accepts non-git folders and :ro" {
+    local dir
+    dir="$(mktemp -d)"
+    LOCAL_PATH="/somewhere/else"
+    SELECTED_REPO="primary"
+    EXTRA_PATHS=()
+
+    run validate_and_add_extra_path "$dir"
+    [ "$status" -eq 0 ]
+
+    EXTRA_PATHS=()
+    validate_and_add_extra_path "${dir}:ro" >/dev/null
+    [ "$(mount_mode "${EXTRA_PATHS[0]}")" = "ro" ]
+    [ "$(mount_path "${EXTRA_PATHS[0]}")" = "$dir" ]
+
+    rm -rf "$dir"
+}
+
+@test "validate_and_add_extra_path refuses duplicates and the primary repo" {
+    local dir
+    dir="$(mktemp -d)"
+    LOCAL_PATH="$dir"
+    SELECTED_REPO="primary"
+    EXTRA_PATHS=()
+
+    run validate_and_add_extra_path "$dir"
+    [ "$status" -ne 0 ]
+
+    LOCAL_PATH="/elsewhere"
+    validate_and_add_extra_path "$dir" >/dev/null
+    run validate_and_add_extra_path "$dir"
+    [ "$status" -ne 0 ]
+
+    rm -rf "$dir"
+}
+
+@test "read-only mounts are marked :ro in the docker args" {
+    local dir
+    dir="$(mktemp -d)"
+    LOCAL_MODE=true
+    LOCAL_PATH="/tmp/r"; SELECTED_REPO="r"; IMAGE_REF="img"; CONTAINER_NAME="cs-t"
+    EXTRA_PATHS=("${dir}|docs|ro")
+
+    build_docker_args
+    [[ "${DOCKER_ARGS[*]}" == *"${dir}:/home/node/workspace/docs:ro"* ]]
+
+    rm -rf "$dir"
+}
+
+@test "MOUNTS config entries resolve relative to the repo" {
+    local base sibling
+    base="$(mktemp -d)"
+    mkdir -p "$base/repo" "$base/api"
+    sibling="$base/api"
+
+    LOCAL_PATH="$base/repo"
+    SELECTED_REPO="repo"
+    EXTRA_PATHS=()
+    MOUNTS="../api"
+
+    add_mounts_from_config "$LOCAL_PATH" >/dev/null 2>&1
+    [ "${#EXTRA_PATHS[@]}" -eq 1 ]
+    [ "$(mount_name "${EXTRA_PATHS[0]}")" = "api" ]
+    [ "$(mount_path "${EXTRA_PATHS[0]}")" = "$(cd "$sibling" && pwd)" ]
+
+    rm -rf "$base"
+}
+
+# ── Precedence ───────────────────────────────────────────────────────────────
+
+@test "explicit flags beat config file values" {
+    local cfg
+    cfg="$(mktemp)"
+    printf 'BROWSER=true\nNETWORK=bridge\n' > "$cfg"
+
+    POSITIONAL=()
+    parse_args --no-browser         # explicit
+    load_config_file "$cfg"
+
+    [ "$BROWSER" = false ]          # flag wins
+    [ "$NETWORK" = "bridge" ]       # config still applies where no flag was given
+
+    rm -f "$cfg"
+}
+
+# ── Headless exec ────────────────────────────────────────────────────────────
+
+@test "exec mode passes the prompt and drops the TTY" {
+    LOCAL_MODE=true
+    LOCAL_PATH="/tmp/r"; SELECTED_REPO="r"; IMAGE_REF="img"; CONTAINER_NAME="cs-t"
+    EXTRA_PATHS=()
+    EXEC_PROMPT="run the tests"
+    AGENT="codex"
+
+    build_docker_args
+    local joined="${DOCKER_ARGS[*]}"
+
+    [[ "$joined" == *"SANDBOX_EXEC=run the tests"* ]]
+    [[ "$joined" == *"SANDBOX_AGENT=codex"* ]]
+    [[ " $joined " == *" -i "* ]]
+    [[ " $joined " != *" -it "* ]]
+}
+
+@test "interactive mode keeps the TTY" {
+    LOCAL_MODE=true
+    LOCAL_PATH="/tmp/r"; SELECTED_REPO="r"; IMAGE_REF="img"; CONTAINER_NAME="cs-t"
+    EXTRA_PATHS=()
+    EXEC_PROMPT=""
+
+    build_docker_args
+    [[ "${DOCKER_ARGS[*]}" == *"-it"* ]]
+    [[ "${DOCKER_ARGS[*]}" != *"SANDBOX_EXEC"* ]]
+}
+
+# ── Worktree isolation ───────────────────────────────────────────────────────
+
+@test "worktree mode mounts the worktree and mirrors the main .git path" {
+    LOCAL_MODE=true
+    LOCAL_PATH="/host/repo"
+    SELECTED_REPO="repo"
+    IMAGE_REF="img"; CONTAINER_NAME="cs-t"
+    EXTRA_PATHS=()
+    WORKTREE_PATH="/host/worktrees/repo-sandbox"
+
+    build_docker_args
+    local joined="${DOCKER_ARGS[*]}"
+
+    # The worktree is what the agent sees as the repo...
+    [[ "$joined" == *"/host/worktrees/repo-sandbox:/home/node/workspace/repo"* ]]
+    # ...and the main .git is mirrored so the gitdir link resolves
+    [[ "$joined" == *"/host/repo/.git:/host/repo/.git"* ]]
+    # The real working tree is never mounted
+    [[ "$joined" != *" /host/repo:/home/node/workspace/repo"* ]]
+}
+
+@test "worktree gitdir target follows the recorded gitdir, not the given path" {
+    # git records a symlink-resolved absolute path in the worktree's .git file;
+    # mounting $LOCAL_PATH/.git blindly would miss it (macOS /var -> /private/var).
+    local base
+    base="$(mktemp -d)"
+    WORKTREE_PATH="$base/tree"
+    mkdir -p "$WORKTREE_PATH"
+    echo "gitdir: /private/real/repo/.git/worktrees/tree" > "$WORKTREE_PATH/.git"
+
+    LOCAL_PATH="/var/link/repo"
+    [ "$(worktree_gitdir_target)" = "/private/real/repo/.git" ]
+
+    rm -rf "$base"
+}
+
+@test "worktree gitdir target falls back to a physical path before creation" {
+    WORKTREE_PATH="/nonexistent/worktree"
+    LOCAL_PATH="/definitely/not/here"
+    [ "$(worktree_gitdir_target)" = "/definitely/not/here/.git" ]
+}
+
+# ── Recent workspaces ────────────────────────────────────────────────────────
+
+@test "recent workspaces round-trip, including paths with spaces and commas" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/my proj" "$base/Acme, Inc" "$base/plain"
+    RECENT_FILE="$base/recent"
+
+    LOCAL_MODE=true
+    LOCAL_PATH="$base/my proj"
+    SELECTED_REPO="my proj"
+    EXTRA_PATHS=("$base/Acme, Inc|acme|ro" "$base/plain|plain|rw")
+
+    remember_workspace
+    [ -f "$RECENT_FILE" ]
+
+    run list_recent_workspaces
+    [[ "$output" == *"my proj + 2 mount(s)"* ]]
+
+    # Restore rebuilds both mounts intact — neither the space nor the comma
+    # may split a path in two.
+    local label path extras
+    IFS=$'\t' read -r label path extras < <(list_recent_workspaces)
+    [ "$path" = "$base/my proj" ]
+
+    EXTRA_PATHS=()
+    LOCAL_PATH=""
+    restore_recent_workspace "$path" "$extras"
+
+    [ "$LOCAL_PATH" = "$base/my proj" ]
+    [ "${#EXTRA_PATHS[@]}" -eq 2 ]
+    [ "$(mount_path "${EXTRA_PATHS[0]}")" = "$base/Acme, Inc" ]
+    [ "$(mount_mode "${EXTRA_PATHS[0]}")" = "ro" ]
+    [ "$(mount_path "${EXTRA_PATHS[1]}")" = "$base/plain" ]
+
+    rm -rf "$base"
+}
+
+@test "paths with spaces survive into the docker arguments" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/my repo" "$base/other dir"
+
+    LOCAL_MODE=true
+    LOCAL_PATH="$base/my repo"
+    SELECTED_REPO="my repo"
+    IMAGE_REF="img"; CONTAINER_NAME="cs-t"
+    EXTRA_PATHS=()
+    validate_and_add_extra_path "$base/other dir" >/dev/null
+
+    build_docker_args
+
+    # Each -v must be ONE argv element, with the space preserved
+    local found_primary=0 found_extra=0 a
+    for a in "${DOCKER_ARGS[@]}"; do
+        [[ "$a" == "$base/my repo:/home/node/workspace/my repo" ]] && found_primary=1
+        [[ "$a" == "$base/other dir:/home/node/workspace/other dir" ]] && found_extra=1
+    done
+    [ "$found_primary" -eq 1 ]
+    [ "$found_extra" -eq 1 ]
+
+    # And the container name must be slug-safe
+    [[ "$CONTAINER_NAME" != *" "* ]]
+
+    rm -rf "$base"
+}
+
+@test "recent workspaces skip directories that no longer exist" {
+    local base
+    base="$(mktemp -d)"
+    RECENT_FILE="$base/recent"
+    printf '%s\t\n' "$base/gone" > "$RECENT_FILE"
+
+    run list_recent_workspaces
+    [ -z "$output" ]
+
+    rm -rf "$base"
+}
+
+# ── Blast radius ─────────────────────────────────────────────────────────────
+
+@test "host agent config is mounted whole and read-write" {
+    # Deliberate: settings, skills, plugins, session history and --resume all
+    # need the real directories. Do not "harden" this by masking or redirecting
+    # them -- it breaks resume and throws away the session transcript.
+    local fake_home
+    fake_home="$(mktemp -d)"
+    mkdir -p "$fake_home/.claude/projects" "$fake_home/.codex" "$fake_home/.agents"
+    HOME="$fake_home"
+
+    LOCAL_MODE=true
+    LOCAL_PATH="/tmp/r"; SELECTED_REPO="r"; IMAGE_REF="img"; CONTAINER_NAME="cs-t"
+    EXTRA_PATHS=()
+    DRY_RUN=true
+
+    build_docker_args
+    local joined="${DOCKER_ARGS[*]}"
+
+    [[ "$joined" == *"$fake_home/.claude:/home/node/.claude"* ]]
+    [[ "$joined" == *"$fake_home/.codex:/home/node/.codex"* ]]
+    [[ "$joined" == *"$fake_home/.agents:/home/node/.agents"* ]]
+
+    # No masking or redirection of anything inside them
+    [[ "$joined" != *"tmpfs,destination=/home/node/.claude"* ]]
+    [[ "$joined" != *"/home/node/.claude/projects"* ]]
+
+    rm -rf "$fake_home"
+}
+
+# ── Durability of local work ─────────────────────────────────────────────────
+
+@test "auto-save defaults off for local mode, on for github clones" {
+    # A bind-mounted repo is already on the host, so a killed container loses
+    # nothing. A clone that lives inside the container does.
+    EXPLICIT_KEYS=()
+    LOCAL_MODE=true
+    AUTO_GIT=false
+    apply_autosave_default
+    [ "$AUTO_GIT" = false ]
+
+    EXPLICIT_KEYS=()
+    LOCAL_MODE=false
+    AUTO_GIT=false
+    apply_autosave_default
+    [ "$AUTO_GIT" = true ]
+}
+
+@test "an explicit --no-auto-git is honoured even for github clones" {
+    EXPLICIT_KEYS=()
+    LOCAL_MODE=false
+    POSITIONAL=()
+    parse_args --no-auto-git
+    apply_autosave_default
+    [ "$AUTO_GIT" = false ]
+}
+
+@test "snapshots are opt-in, not taken by default" {
+    EXPLICIT_KEYS=()
+    POSITIONAL=()
+    parse_args .
+    [ "$SNAPSHOT" = false ]
+
+    POSITIONAL=()
+    parse_args . --snapshot
+    [ "$SNAPSHOT" = true ]
+}
+
+@test "snapshots cover every writable mounted repo, skipping read-only ones" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/primary" "$base/api" "$base/readonly"
+    SNAPSHOT=true
+    LOCAL_MODE=true
+    WORKTREE_PATH=""
+    LOCAL_PATH="$base/primary"
+    EXTRA_PATHS=("$base/api|api|rw" "$base/readonly|readonly|ro")
+
+    # None are git repos, so nothing is recorded — but the walk must not fail
+    run snapshot_all_repos
+    [ "$status" -eq 0 ]
+
+    rm -rf "$base"
+}
+
+@test "snapshot leaves HEAD, the index and the working tree untouched" {
+    if ! command -v git >/dev/null 2>&1; then
+        skip "git not available in this environment"
+    fi
+
+    local repo
+    repo="$(mktemp -d)"
+    (
+        cd "$repo"
+        git init -q
+        echo committed > a.txt
+        git add -A
+        git -c user.email=t@t -c user.name=t commit -qm base
+        echo modified > a.txt
+        echo untracked > b.txt
+    ) >/dev/null 2>&1
+
+    local head_before status_before
+    head_before=$(git -C "$repo" rev-parse HEAD)
+    status_before=$(git -C "$repo" status --porcelain)
+
+    SNAPSHOT=true
+    SNAPSHOT_REFS=()
+    snapshot_repo "$repo"
+
+    [ "$(git -C "$repo" rev-parse HEAD)" = "$head_before" ]
+    [ "$(git -C "$repo" status --porcelain)" = "$status_before" ]
+    [ "${#SNAPSHOT_REFS[@]}" -eq 1 ]
+
+    # Both the modified tracked file and the untracked one are recoverable
+    local ref="${SNAPSHOT_REFS[0]##*|}"
+    [ "$(git -C "$repo" show "${ref}:a.txt")" = "modified" ]
+    [ "$(git -C "$repo" show "${ref}:b.txt")" = "untracked" ]
+
+    rm -rf "$repo"
+}
+
+@test "terminal control codes never reach a piped stdout" {
+    # `cs exec ... | jq` and `cs --dry-run > file` must not receive escape
+    # sequences from cursor restoration.
+    run cleanup_terminal
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
 }

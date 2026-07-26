@@ -1,215 +1,242 @@
 # Claude Sandbox
 
-Run [Claude Code](https://claude.ai/code) with `--dangerously-skip-permissions` safely in an isolated Docker container.
+Run [Claude Code](https://claude.ai/code) and [Codex](https://developers.openai.com/codex/cli) with every approval prompt disabled, inside a container you can throw away.
 
 ![Claude Sandbox](screenshot.png)
 
-## Why?
+## Why
 
-Claude Code's `--dangerously-skip-permissions` flag lets Claude execute commands without asking for approval - great for productivity, but risky on your main machine. Claude Sandbox gives you the best of both worlds:
+`--dangerously-skip-permissions` is the most useful and most alarming flag in Claude Code. An agent that never stops to ask is dramatically more productive, and also one bad command away from your home directory. Claude Sandbox gives the agent a container to be reckless in.
 
-- **Full autonomy** - Claude can run any command without interruption
-- **Complete isolation** - Container is destroyed after each session
-- **Auto-save to GitHub** - Changes are committed every 60s, never lose work
-- **SSH forwarding** - Your GitHub credentials work without copying keys
+- **No prompts** — agents run fully unattended
+- **Disposable** — the container is destroyed on exit
+- **Your credentials work** — SSH agent, GitHub CLI, AWS SSO, all forwarded, none copied
+- **Local-first** — sandbox any folder on your machine, or clone from GitHub
+- **Your checkout stays clean** — `--worktree` gives the agent its own branch and directory
 
-## Features
+## What this protects against (and what it doesn't)
 
-- Interactive branch selection and creation
-- **Local mode** - work on local repos without cloning (`cs .`)
-- Auto-commit changes to GitHub every 60s
-- Host credential forwarding (AWS SSO, GitHub CLI, SSH)
-- Claude Code + [OpenAI Codex](https://github.com/openai/codex) support
-- Python + Node.js + common tools (jq, boto3, requests, AWS CLI) pre-installed
-- Beautiful terminal UI with Powerlevel10k
-- Host network mode - any port just works
+Be clear-eyed about this, because the distinction matters.
+
+**It protects against accidents.** A wrong `rm -rf`, a migration against the wrong database, a runaway build, an `npm install` of something awful, a dependency that decides to rewrite your dotfiles. The blast radius is a container that ceases to exist when you close the terminal.
+
+**It does not contain a hostile agent.** To be useful, the sandbox forwards real credentials:
+
+| Mounted / forwarded | Why | What an agent could do with it |
+|---|---|---|
+| SSH agent socket | git push | Sign as you — push to any repo your key can reach |
+| `GH_TOKEN` from `gh` | GitHub CLI | Act as you on GitHub, at whatever scope your token has |
+| `~/.aws` | AWS SSO | Use any profile with an active session |
+| `~/.claude` | settings, skills, plugins | Edit config and hooks that later run on your **host** |
+| `--network host` | dev servers "just work" | Reach anything your machine can, including localhost services |
+
+So: **a compromised or prompt-injected agent inside this sandbox is not contained.** If you are running untrusted code or processing untrusted input, this is the wrong tool — use an isolated VM, or Claude Code's [native sandboxing](https://code.claude.com/docs/en/sandboxing) with a network allowlist.
+
+`~/.claude` is mounted whole and read-write on purpose — settings, skills, plugins, session history and `--resume` all need the real thing.
+
+What Claude Sandbox does give you:
+
+- Host **file permissions are never modified**. (An earlier version ran `chmod -R 777` across the workspace, which in local mode propagated straight to your real repository. Fixed, and there's a test.)
+- Mounted folders can be made **read-only** with `-m path:ro`.
+- With `--worktree`, your working tree is **not mounted at all** — the agent works on a scratch branch in a separate directory.
 
 ## Requirements
 
-- **Docker** - [OrbStack](https://orbstack.dev/) (recommended) or [Docker Desktop](https://docker.com/products/docker-desktop)
+- **Docker** — [OrbStack](https://orbstack.dev/) (recommended) or Docker Desktop
 - **macOS** or **Linux**
-- [GitHub CLI](https://cli.github.com/) (`gh`)
-- [Claude Code](https://claude.ai/code) with active subscription
+- `gh`, `gum`, `jq` — the installer offers to install these
+- A Claude Code subscription or API key
 
-## Installation
-
-### One-liner
+## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rsh3khar/claude-sandbox/main/install.sh | bash
 ```
 
-### Manual
+This installs a pinned release, verifies it against the published `SHA256SUMS`, and pulls the prebuilt multi-arch image from GHCR (falling back to a local build if the registry is unreachable).
 
 ```bash
-# Clone the repo
-git clone https://github.com/rsh3khar/claude-sandbox.git
-cd claude-sandbox
-
-# Run installer
-./install.sh
-```
-
-The installer will:
-1. Check and install dependencies (`gh`, `gum`, `jq`)
-2. Build the Docker image
-3. Set up Claude Code authentication
-
-### Developer Mode
-
-For contributors who want changes to take effect immediately:
-
-```bash
-./install.sh --link    # Symlinks ~/.claude-sandbox to repo
-./install.sh --update  # Rebuild Docker image after changes
-```
-
-### Other Commands
-
-```bash
-./install.sh --help       # Show all options
-./install.sh --uninstall  # Remove claude-sandbox completely
-./install.sh --skip-deps  # Skip dependency checks
-./install.sh --skip-build # Skip Docker image build
+./install.sh --version v0.3.0   # pin a specific release
+./install.sh --no-pull          # always build the image locally
+./install.sh --link             # dev mode: symlink to a clone
+./install.sh --uninstall
 ```
 
 ## Usage
 
-### Interactive Mode
+### Local folders
 
 ```bash
-claude-sandbox
-# or
-cs  # if you set up the alias
+cs .                      # sandbox the current repo (from any subdirectory)
+cs ~/projects/my-app      # any folder — git or not
+cs . -w                   # worktree mode: your checkout is never touched
+cs . -m ~/work/api -m ~/notes:ro    # mount siblings, some read-only
 ```
 
-This opens an interactive menu to:
-- Select a repository from your GitHub account
-- Choose or create a branch
-- Launch the sandbox
+Recent workspaces are remembered along with their mounts, so a multi-repo session is one pick away next time.
 
-### Local Mode
+A repo that always needs the same companions can say so once. Commit a `.claude-sandbox` file:
 
-Mount a local repo directly (no clone, changes stay local):
-
-```bash
-cs .                    # Current directory
-cs ~/projects/my-app    # Any local git repo
+```ini
+MOUNTS=../api,../web,~/design-docs:ro
+WORKTREE=true
+BROWSER=true
 ```
 
-### GitHub Mode
+Config files are **parsed, not sourced** — a `.claude-sandbox` in a repo you just cloned cannot run code on your machine.
 
-Clone from GitHub into an isolated container:
+### GitHub repos
 
 ```bash
 cs owner/repo
+cs owner/repo -b feature/login
 cs git@github.com:owner/repo.git
 ```
 
-### Inside the Sandbox
+### Headless
 
 ```bash
-# Claude Code (auto-skips permissions)
-c       # or: claude
-
-# OpenAI Codex
-x       # or: codex
-
-# Your changes auto-commit every 60s
-# Just work and let the sandbox handle git
+cs exec "run the test suite and summarize failures"
+cs exec "review the diff on this branch" ~/work/api --agent codex
 ```
 
-## How It Works
+Only the agent's output goes to stdout, so it pipes and scripts cleanly.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Host (macOS/Linux)                                             │
-│                                                                 │
-│  ~/.claude/    ~/.ssh/    ~/.aws/    ~/.config/gh/   SSH Agent  │
-│       │           │          │            │              │      │
-└───────┼───────────┼──────────┼────────────┼──────────────┼──────┘
-        │ mount     │ mount    │ mount      │ mount        │ fwd
-        ▼           ▼          ▼            ▼              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Container (isolated, destroyed on exit)                        │
-│                                                                 │
-│  ~/workspace/<repo>/    Git clone or local mount                │
-│  Claude Code + Codex    (--dangerously-skip-permissions)        │
-│  Auto-git daemon        Commits every 60s                       │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-All host mounts are guarded — only mounted if the directory exists.
-
-## Branch Management
-
-When you launch the sandbox, you'll see an interactive branch menu:
-
-```
-Select a branch
-
-  1) ● main (current)
-  2) ● dev
-  3) ◇ sandbox-20260124-155720
-
-  n) New branch (name it yourself)
-  q) Quick branch (auto: sandbox-timestamp)
-  d) Delete sandbox branches (1 found)
-
-▸ Choice [1]:
-```
-
-- **●** = synced with origin
-- **◇** = sandbox branch (auto-generated)
-- **n)** = create named branch (e.g., "add dark mode" → `feature/add-dark-mode`)
-- **q)** = quick sandbox branch with timestamp
-- **d)** = bulk delete sandbox branches
-
-## Authentication
-
-Claude Sandbox uses OAuth tokens for Claude Code authentication:
+### Managing sandboxes
 
 ```bash
-# Generate a token (valid for 1 year)
-claude setup-token
-
-# Save it securely
-echo 'YOUR_TOKEN' > ~/.claude-sandbox-token
-chmod 600 ~/.claude-sandbox-token
+cs ps          # running sandboxes and their mounts
+cs attach      # open a second shell in one
+cs orphans     # sandboxes whose terminal is gone
+cs kill --all
+cs doctor      # check your setup
 ```
 
-The installer will guide you through this.
-
-## Configuration
-
-Files are installed to `~/.claude-sandbox/`. Token stored at `~/.claude-sandbox-token` (chmod 600).
-
-## Running Dev Servers
-
-The container uses `--network host`, so any port works automatically:
+### Inside the sandbox
 
 ```bash
-# Frontend (Vite)
-cd frontend && npm run dev
-# → http://localhost:5173
-
-# Backend (Python)
-cd backend && pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000
-# → http://localhost:8000
+c    # claude, permissions off
+x    # codex, permissions off
 ```
 
-## Screenshot Sharing
+## Worktree mode
 
-Claude inside the container can't access your clipboard. To share screenshots:
+```bash
+cs . --worktree
+```
 
-**Option 1: Let installer configure it**
+The agent gets a git worktree on a scratch branch. Your working tree is never mounted, so it cannot be dirtied — but commits land in your repo's object store, so on the host:
 
-The installer will ask to change your macOS screenshot save location to `~/.claude/screenshots/`. Then:
-1. Take screenshot (Cmd+Shift+4)
-2. Tell Claude "check the screenshot"
+```bash
+git log sandbox/20260726-143022     # review what the agent did
+git merge sandbox/20260726-143022   # keep it
+```
 
-**Option 2: Manual setup**
+On exit, an untouched worktree is removed automatically; one with work in it is kept, and the exact review/merge/discard commands are printed.
+
+## Auto-save
+
+Off by default — a commit every 60 seconds buries real history under dozens of `auto-save #N` commits.
+
+```bash
+cs . --auto-git --interval 120
+```
+
+When enabled it commits only when there are changes, and refuses to commit during a merge, rebase, cherry-pick, or on a detached HEAD.
+
+## What happens to your local folders
+
+They are bind-mounted, which means the agent edits **your real files, live** — that is the point, and it is why changes show up in your editor immediately.
+
+Two consequences worth being clear about:
+
+- **Killing the sandbox loses nothing.** Writes go straight to your disk as they happen; there is no copy to lose. Uncommitted work is still there afterwards.
+- **The agent can delete things for real.** `rm` inside the container removes the file from your disk. Committed files come back with `git checkout`; *untracked* files have nothing to come back from.
+
+If you routinely have untracked work you would miss, `--snapshot` records the working tree (including untracked files, excluding gitignored ones) to `refs/claude-sandbox/pre-session/<ts>` before starting. It never touches HEAD, your index, your working tree or your stash, and restore commands are printed on exit:
+
+```bash
+cs . --snapshot
+# later
+git diff --stat <ref>                     # what did this session change?
+git checkout <ref> -- path/to/file        # bring one file back
+```
+
+Off by default — most sessions do not need it.
+
+## Options
+
+| Flag | Effect |
+|---|---|
+| `-y, --yes` | No prompts, use defaults |
+| `-w, --worktree` | Isolate work in a git worktree |
+| `-b, --branch <name>` | Check out or create a branch |
+| `-m, --mount <path[:ro]>` | Mount another folder |
+| `-n, --name <name>` | Container name |
+| `--agent claude\|codex` | Agent for `exec` |
+| `--auto-git` / `--interval <s>` | Periodic commits |
+| `--browser` | Headless Chromium + Playwright MCP |
+| `--update-tools` | Update agent CLIs at startup |
+| `--snapshot` | Record the working tree first (see below) |
+| `--network <mode>` / `-p a:b` | Networking |
+| `--image <ref>` / `--pull` / `--no-pull` | Image selection |
+| `--dry-run` | Print the docker command and exit |
+
+Global defaults live in `~/.config/claude-sandbox/config`, using the same keys.
+
+## How it works
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Host                                                            │
+│  ~/.claude   ~/.ssh   ~/.aws   ~/.config/gh   SSH agent          │
+│      │                                              │            │
+└──────┼──────────────────────────────────────────────┼────────────┘
+       │ mount                                       │ forward
+       ▼                                             ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  Container (destroyed on exit)                                   │
+│                                                                  │
+│  ~/workspace/<repo>/      your folder, or a git worktree of it   │
+│  ~/workspace/<other>/     extra mounts, rw or ro                 │
+│  claude / codex           permissions disabled                   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+Containers are labelled `com.claude-sandbox.managed=true`, which is how `ps`, `attach` and `kill` find them regardless of image tag.
+
+## Development
+
+Everything runs through Docker — no host tooling to install.
+
+```bash
+make check        # lint + format check + unit tests
+make test         # bats unit tests (no Docker daemon needed)
+make build        # build the image
+make test-image   # build, then smoke-test the image
+make dry-run      # print the docker command for this repo
+make dev          # symlink ~/.claude-sandbox to this clone, then build
+```
+
+`claude-sandbox` is safe to `source` — `main` only runs when executed — which is how the unit tests exercise its internals.
+
+## Releases
+
+Commits follow [Conventional Commits](https://www.conventionalcommits.org/). [release-please](https://github.com/googleapis/release-please) opens a release PR that maintains `CHANGELOG.md` and the version in `claude-sandbox`; merging it tags the release, publishes a verified tarball, and pushes a multi-arch image to `ghcr.io/rsh3khar/claude-sandbox` with build provenance.
+
+## Troubleshooting
+
+**AWS credentials expired** — refresh on the host with `aws sso login`; `~/.aws` is bind-mounted, so the container picks it up immediately.
+
+**Claude asks for login** — regenerate with `claude setup-token`, then `echo 'TOKEN' > ~/.claude-sandbox-token && chmod 600 ~/.claude-sandbox-token`.
+
+**Port not reachable** — bind to `0.0.0.0`, not `127.0.0.1`. On Docker Desktop, host networking must be enabled in settings; otherwise use `--network bridge -p 3000:3000`. `cs doctor` will tell you which runtime you're on.
+
+**A sandbox outlived its terminal** — `cs orphans`, then `cs kill <name>`.
+
+## Screenshots
+
+Clipboard doesn't cross the container boundary. Point macOS screenshots at a shared folder (the installer offers to do this):
 
 ```bash
 mkdir -p ~/.claude/screenshots
@@ -217,58 +244,8 @@ defaults write com.apple.screencapture location ~/.claude/screenshots
 killall SystemUIServer
 ```
 
-**Option 3: One-off sharing**
-
-```bash
-# Install pngpaste
-brew install pngpaste
-
-# Copy clipboard to shared folder
-pngpaste ~/.claude/screenshots/shot.png
-```
-
-**To restore default screenshot location:**
-```bash
-defaults write com.apple.screencapture location ~/Desktop
-killall SystemUIServer
-```
-
-## Troubleshooting
-
-### AWS credentials not working
-
-Credentials are bind-mounted from `~/.aws`, not copied. Refresh on the **host**:
-```bash
-aws sso login           # On host, not inside container
-```
-The container picks up the refresh immediately — no restart needed.
-
-### SSH not working
-
-Make sure your SSH agent is running:
-```bash
-ssh-add -l  # Should list your keys
-```
-
-### Claude asks for login
-
-Your OAuth token might be missing or expired:
-```bash
-claude setup-token
-echo 'YOUR_TOKEN' > ~/.claude-sandbox-token
-```
-
-### Port not accessible
-
-Bind to `0.0.0.0`, not `127.0.0.1`:
-```bash
-npm run dev -- --host  # binds to 0.0.0.0
-```
+Then take a screenshot and say "check the screenshot".
 
 ## License
 
-MIT - do whatever you want with it.
-
-## Credits
-
-Built with Claude Code, for Claude Code users.
+MIT.

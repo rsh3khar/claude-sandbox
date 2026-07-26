@@ -29,6 +29,10 @@ readonly SCRIPT_DIR
 # file is executed, not sourced — an EXIT trap set at source time would
 # clobber the caller's own (bats, for one, reports results from its EXIT trap).
 cleanup_terminal() {
+    # Only emit terminal control sequences to a real terminal. When stdout is a
+    # pipe — `cs exec ... > file`, `cs . --dry-run | grep` — these would end up
+    # in the captured output and corrupt it.
+    [[ -t 1 ]] || return 0
     tput cnorm 2>/dev/null || true  # Show cursor
     stty echo 2>/dev/null || true   # Enable echo
 }
@@ -81,6 +85,13 @@ SANDBOX_BRANCH="${CS_BRANCH:-}"
 PUBLISH_PORTS=()
 ASSUME_YES=false
 DRY_RUN=false
+WORKTREE="${CS_WORKTREE:-false}"   # isolate work in a git worktree
+WORKTREE_PATH=""                   # host path of the created worktree
+WORKTREE_CREATED=false
+EXEC_PROMPT=""                     # non-empty => headless one-shot run
+AGENT="${CS_AGENT:-claude}"
+SNAPSHOT="${CS_SNAPSHOT:-false}"   # opt-in: record the working tree before launching
+MOUNTS=""                          # set by config files, consumed on load
 
 # Gum styling via environment variables (amber theme)
 export GUM_CHOOSE_CURSOR="▸ "
@@ -186,10 +197,14 @@ draw_mini_logo() {
 # │ Output helpers                                                          │
 # └─────────────────────────────────────────────────────────────────────────┘
 
-say_ok()   { echo -e "  ${C_SUCCESS}${CHECK}${NC} $*"; }
-say_warn() { echo -e "  ${C_WARN}${BULLET}${NC} $*"; }
+# In headless mode chatter goes to stderr so stdout carries only agent output.
+QUIET=false
+_say() { if [[ "$QUIET" == true ]]; then echo -e "$*" >&2; else echo -e "$*"; fi; }
+
+say_ok()   { _say "  ${C_SUCCESS}${CHECK}${NC} $*"; }
+say_warn() { _say "  ${C_WARN}${BULLET}${NC} $*"; }
 say_err()  { echo -e "  ${C_ERROR}${CROSS}${NC} $*" >&2; }
-say_dim()  { echo -e "  ${C_DIM}${RING}${NC} ${C_DIM}$*${NC}"; }
+say_dim()  { _say "  ${C_DIM}${RING}${NC} ${C_DIM}$*${NC}"; }
 
 die() {
     say_err "$*"
@@ -234,7 +249,20 @@ animate_spinner() {
 
 # Config files are parsed, never sourced: `cs .` in an untrusted repo must not
 # be able to execute code on the host.
-readonly CONFIG_KEYS="AUTO_GIT AUTO_GIT_INTERVAL BROWSER UPDATE_TOOLS NETWORK PULL_POLICY IMAGE_REF"
+readonly CONFIG_KEYS="AUTO_GIT AUTO_GIT_INTERVAL BROWSER UPDATE_TOOLS NETWORK PULL_POLICY IMAGE_REF WORKTREE AGENT MOUNTS SNAPSHOT"
+
+# Options set explicitly on the command line always beat config files, which
+# are loaded later (a repo's .claude-sandbox is only found after the target is
+# resolved).
+EXPLICIT_KEYS=()
+mark_explicit() { EXPLICIT_KEYS+=("$1"); }
+is_explicit() {
+    local k
+    for k in ${EXPLICIT_KEYS[@]+"${EXPLICIT_KEYS[@]}"}; do
+        [[ "$k" == "$1" ]] && return 0
+    done
+    return 1
+}
 
 load_config_file() {
     local file="$1"
@@ -255,11 +283,14 @@ load_config_file() {
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
 
-        # Allowlist keys and reject anything that isn't a plain scalar
+        # Allowlist keys and reject anything that isn't a plain scalar.
+        # Commas, ~ and spaces are allowed for MOUNTS; no shell metacharacters.
         [[ " $CONFIG_KEYS " == *" $key "* ]] || continue
-        [[ "$value" =~ ^[A-Za-z0-9._:/@-]*$ ]] || continue
+        [[ "$value" =~ ^[A-Za-z0-9._:/@,~\ -]*$ ]] || continue
+        is_explicit "$key" && continue
 
         printf -v "$key" '%s' "$value"
+        mark_explicit "$key"
     done < "$file"
 }
 
@@ -411,8 +442,25 @@ draw_user_card() {
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
-# │ Extra Mount Helpers                                                     │
+# │ Local Paths & Extra Mounts                                              │
 # └─────────────────────────────────────────────────────────────────────────┘
+
+# EXTRA_PATHS entries are "abs_path|mount_name|mode". Pipe-separated because
+# absolute paths may legitimately contain a colon.
+mount_path() { local e="$1"; echo "${e%%|*}"; }
+mount_name() { local e="${1#*|}"; echo "${e%%|*}"; }
+mount_mode() { local e="$1"; echo "${e##*|}"; }
+
+# Walk up to the repository root, so `cs .` works from any subdirectory.
+git_root_of() {
+    git -C "$1" rev-parse --show-toplevel 2>/dev/null
+}
+
+# Expand ~, resolve to an absolute path
+abs_path_of() {
+    local p="${1/#\~/$HOME}"
+    (cd "$p" 2>/dev/null && pwd)
+}
 
 # Resolve a unique mount name, appending -2, -3, etc. on collision
 resolve_mount_name() {
@@ -429,7 +477,7 @@ resolve_mount_name() {
         fi
         if [[ "$collision" == false ]]; then
             for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
-                if [[ "$name" == "${ep##*:}" ]]; then
+                if [[ "$name" == "$(mount_name "$ep")" ]]; then
                     collision=true
                     break
                 fi
@@ -443,39 +491,154 @@ resolve_mount_name() {
     echo "$name"
 }
 
-# Validate a path and add it to EXTRA_PATHS. Returns 0 on success, 1 on failure.
+# Add a mount. Accepts "path", "path:ro", or "path:name" forms.
+# Non-git directories are allowed — plenty of useful mounts are just notes,
+# data, or design assets.
 validate_and_add_extra_path() {
-    local raw_path="$1"
+    local spec="$1"
+    local mode="rw" raw_path="$spec"
 
-    raw_path="${raw_path/#\~/$HOME}"
-    local abs_path
-    abs_path=$(cd "$raw_path" 2>/dev/null && pwd) || {
+    if [[ "$spec" == *:ro ]]; then
+        mode="ro"
+        raw_path="${spec%:ro}"
+    elif [[ "$spec" == *:rw ]]; then
+        raw_path="${spec%:rw}"
+    fi
+
+    local abs
+    abs=$(abs_path_of "$raw_path") || {
         say_err "Directory not found: ${raw_path}"
         return 1
     }
 
-    if [[ ! -e "$abs_path/.git" ]]; then
-        say_err "Not a git repository: ${abs_path}"
-        return 1
-    fi
+    # Mount the repo root, not a subdirectory of it
+    local root
+    root=$(git_root_of "$abs") && [[ -n "$root" ]] && abs="$root"
 
-    if [[ "$abs_path" == "$LOCAL_PATH" ]]; then
-        say_warn "Already the primary repo: ${abs_path}"
+    if [[ "$abs" == "$LOCAL_PATH" ]]; then
+        say_warn "Already the primary repo: ${abs}"
         return 1
     fi
     for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
-        if [[ "$abs_path" == "${ep%%:*}" ]]; then
-            say_warn "Already added: ${abs_path}"
+        if [[ "$abs" == "$(mount_path "$ep")" ]]; then
+            say_warn "Already added: ${abs}"
             return 1
         fi
     done
 
-    local mount_name
-    mount_name=$(resolve_mount_name "$(basename "$abs_path")")
-    EXTRA_PATHS+=("${abs_path}:${mount_name}")
+    local name
+    name=$(resolve_mount_name "$(basename "$abs")")
+    EXTRA_PATHS+=("${abs}|${name}|${mode}")
 
-    say_ok "Added: ${C_ACCENT}${mount_name}${NC} ${C_DIM}(${abs_path})${NC}"
+    local note=""
+    [[ "$mode" == "ro" ]] && note=" ${C_DIM}[read-only]${NC}"
+    [[ -e "$abs/.git" ]] || note+=" ${C_DIM}(not a git repo)${NC}"
+    say_ok "Added: ${C_ACCENT}${name}${NC} ${C_DIM}(${abs})${NC}${note}"
     return 0
+}
+
+# MOUNTS=../api,../web:ro  in a .claude-sandbox file. Relative paths resolve
+# against the repo the config came from.
+add_mounts_from_config() {
+    local base_dir="$1"
+    [[ -n "${MOUNTS:-}" ]] || return 0
+
+    local spec resolved
+    local IFS_SAVE="$IFS"
+    IFS=','
+    for spec in $MOUNTS; do
+        IFS="$IFS_SAVE"
+        spec="${spec#"${spec%%[![:space:]]*}"}"
+        spec="${spec%"${spec##*[![:space:]]}"}"
+        [[ -z "$spec" ]] && continue
+
+        resolved="$spec"
+        if [[ "$spec" != /* && "$spec" != ~* ]]; then
+            resolved="${base_dir}/${spec}"
+        fi
+        validate_and_add_extra_path "$resolved" >/dev/null 2>&1 \
+            && say_ok "Mounted from config: ${C_ACCENT}$(basename "${spec%%:*}")${NC}" \
+            || say_warn "Config mount skipped: ${spec}"
+        IFS=','
+    done
+    IFS="$IFS_SAVE"
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Recent Workspaces                                                       │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# Local sessions are the common case, and re-typing the same set of mounts
+# every time is the main friction. Remember them.
+
+RECENT_FILE="${CLAUDE_SANDBOX_RECENT:-$HOME/.config/claude-sandbox/recent}"
+readonly RECENT_MAX=10
+
+remember_workspace() {
+    [[ "$LOCAL_MODE" == true && -n "$LOCAL_PATH" ]] || return 0
+
+    # Tab-separated, not comma: a mount path may legitimately contain a comma
+    # (e.g. ~/Clients/Acme, Inc/api) and would otherwise be split in two.
+    local extras=""
+    for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+        extras+="${extras:+$'\t'}$(mount_path "$ep")"
+        [[ "$(mount_mode "$ep")" == "ro" ]] && extras+=":ro"
+    done
+
+    mkdir -p "$(dirname "$RECENT_FILE")" 2>/dev/null || return 0
+    local entry="${LOCAL_PATH}	${extras}"
+    local tmp
+    tmp=$(mktemp) || return 0
+    # Every branch must succeed: a missing recent file (first ever launch) or a
+    # grep that matches nothing would otherwise fail the pipeline under set -e
+    # and abort the launch.
+    {
+        printf '%s\n' "$entry"
+        if [[ -f "$RECENT_FILE" ]]; then
+            grep -vF "${LOCAL_PATH}	" "$RECENT_FILE" 2>/dev/null || true
+        fi
+    } > "$tmp".all || true
+    head -n "$RECENT_MAX" "$tmp".all > "$tmp" 2>/dev/null || true
+    rm -f "$tmp".all
+    mv "$tmp" "$RECENT_FILE" 2>/dev/null || rm -f "$tmp"
+    return 0
+}
+
+# Emit "label<TAB>path<TAB>extras" for each still-existing recent workspace
+list_recent_workspaces() {
+    [[ -f "$RECENT_FILE" ]] || return 0
+
+    local line path extras label count
+    while IFS= read -r line; do
+        path="${line%%$'\t'*}"
+        extras=""
+        [[ "$line" == *$'\t'* ]] && extras="${line#*$'\t'}"
+
+        [[ -n "$path" && -d "$path" ]] || continue
+        label="$(basename "$path")"
+        if [[ -n "$extras" ]]; then
+            count=$(awk -F'\t' '{print NF}' <<< "$extras")
+            label+=" + ${count} mount(s)"
+        fi
+        printf '%s\t%s\t%s\n' "$label" "$path" "$extras"
+    done < "$RECENT_FILE"
+}
+
+restore_recent_workspace() {
+    local path="$1" extras="$2"
+
+    LOCAL_MODE=true
+    LOCAL_PATH="$path"
+    SELECTED_REPO=$(basename "$path")
+    EXTRA_PATHS=()
+
+    # Tab-delimited; read -r keeps spaces and commas in paths intact.
+    # The `|| [[ -n "$spec" ]]` matters: the input has no trailing newline, so
+    # a plain `read` would silently drop the last mount.
+    local spec
+    while IFS= read -r spec || [[ -n "$spec" ]]; do
+        [[ -n "$spec" ]] && validate_and_add_extra_path "$spec" >/dev/null 2>&1
+    done < <(printf '%s' "$extras" | tr '\t' '\n')
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
@@ -549,6 +712,218 @@ resolve_image() {
     fi
 
     die "No image available. Pull failed and no Dockerfile found in ${SCRIPT_DIR}"
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Pre-session Snapshot                                                    │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# Opt-in (--snapshot). Killing the container does NOT lose local work: a bind
+# mount writes through to the host as the agent types, so uncommitted files
+# are already on disk. The only thing this covers is the agent itself deleting
+# or overwriting something git cannot restore — i.e. untracked files. That is
+# rare enough not to be worth doing to every repo by default.
+#
+# Records the working tree (tracked AND untracked, ignored files excluded) as
+# a commit object under a private ref. Never touches HEAD, the index, the
+# working tree, or the stash — staging goes through a temporary index.
+
+readonly SNAPSHOT_REF_PREFIX="refs/claude-sandbox/pre-session"
+readonly SNAPSHOT_KEEP=10
+SNAPSHOT_REFS=()   # "repo_path|ref" per snapshotted repo
+
+# Every mounted folder is writable, not just the primary one, so snapshot each
+# git repo in the session.
+snapshot_all_repos() {
+    [[ "$SNAPSHOT" == true && "$LOCAL_MODE" == true ]] || return 0
+
+    SNAPSHOT_REFS=()
+
+    # The primary repo, unless it's already isolated behind a worktree
+    [[ -z "$WORKTREE_PATH" ]] && snapshot_repo "$LOCAL_PATH"
+
+    local ep path
+    for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+        [[ "$(mount_mode "$ep")" == "ro" ]] && continue   # can't be damaged
+        path=$(mount_path "$ep")
+        snapshot_repo "$path"
+    done
+
+    return 0
+}
+
+snapshot_repo() {
+    local repo="$1"
+
+    [[ "$SNAPSHOT" == true ]] || return 0
+    [[ -d "$repo" ]] || return 0
+    git -C "$repo" rev-parse --verify HEAD >/dev/null 2>&1 || return 0
+
+    local ts ref tmp_index parent tree commit head_tree
+    ts=$(date +%Y%m%d-%H%M%S)
+    ref="${SNAPSHOT_REF_PREFIX}/${ts}"
+    tmp_index=$(mktemp -u -t cs-index.XXXXXX)
+    parent=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || return 0
+
+    (
+        export GIT_INDEX_FILE="$tmp_index"
+        git -C "$repo" read-tree HEAD 2>/dev/null &&
+            git -C "$repo" add -A 2>/dev/null &&
+            git -C "$repo" write-tree 2>/dev/null
+    ) > "${tmp_index}.tree" 2>/dev/null || { rm -f "$tmp_index" "${tmp_index}.tree"; return 0; }
+
+    tree=$(cat "${tmp_index}.tree" 2>/dev/null | tail -1)
+    rm -f "$tmp_index" "${tmp_index}.tree"
+    [[ -n "$tree" ]] || return 0
+
+    # Nothing uncommitted? HEAD already is the restore point.
+    head_tree=$(git -C "$repo" rev-parse "HEAD^{tree}" 2>/dev/null || echo "")
+    if [[ "$tree" == "$head_tree" ]]; then
+        return 0
+    fi
+
+    # Identity must be supplied explicitly: commit-tree refuses to run when the
+    # machine has no user.email configured, which would make snapshots fail
+    # silently on exactly the setups least likely to notice.
+    commit=$(git -C "$repo" \
+        -c user.name="claude-sandbox" \
+        -c user.email="claude-sandbox@localhost" \
+        commit-tree "$tree" -p "$parent" \
+        -m "claude-sandbox: working tree before session ${ts}" 2>/dev/null) || return 0
+    git -C "$repo" update-ref "$ref" "$commit" 2>/dev/null || return 0
+
+    SNAPSHOT_REFS+=("${repo}|${ref}")
+    prune_snapshots "$repo"
+}
+
+# Keep the most recent N; these are cheap but shouldn't grow forever.
+prune_snapshots() {
+    local repo="$1" old
+    while IFS= read -r old; do
+        [[ -n "$old" ]] && git -C "$repo" update-ref -d "$old" 2>/dev/null || true
+    done < <(git -C "$repo" for-each-ref --format='%(refname)' --sort=-refname \
+        "${SNAPSHOT_REF_PREFIX}/*" 2>/dev/null | tail -n +$((SNAPSHOT_KEEP + 1)))
+}
+
+report_snapshot() {
+    [[ ${#SNAPSHOT_REFS[@]} -gt 0 ]] || return 0
+
+    local entry repo ref changed shown=false
+    for entry in "${SNAPSHOT_REFS[@]}"; do
+        repo="${entry%%|*}"
+        ref="${entry##*|}"
+        changed=$(git -C "$repo" diff --stat "$ref" 2>/dev/null | tail -1)
+        [[ -n "$changed" ]] || continue
+
+        if [[ "$shown" == false ]]; then
+            echo ""
+            say_ok "Pre-session snapshots — nothing you had is lost:"
+            shown=true
+        fi
+        echo -e "     ${C_ACCENT}$(basename "$repo")${NC} ${C_DIM}${changed# }${NC}"
+        echo -e "       ${C_DIM}review:  ${C_TEXT}git -C $(printf '%q' "$repo") show --stat ${ref}${NC}"
+        echo -e "       ${C_DIM}restore: ${C_TEXT}git -C $(printf '%q' "$repo") restore --source=${ref} -- .${NC}"
+    done
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Worktree Isolation                                                      │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# With --worktree the agent gets its own git worktree on a scratch branch
+# instead of your working tree. Your checkout is never touched, but the
+# commits land in your repo's object store, so `git log <branch>` and
+# `git merge` work immediately on the host.
+#
+# The worktree's .git is a *file* pointing at an absolute path inside the main
+# repo, so the container gets that path bind-mounted at the identical location
+# — that's what makes git fully functional inside the sandbox.
+
+readonly WORKTREE_ROOT="${CLAUDE_SANDBOX_WORKTREES:-$HOME/.claude-sandbox-worktrees}"
+
+
+setup_worktree() {
+    local repo_path="$1"
+    local branch="${2:-}"
+
+    if [[ -z "$branch" ]]; then
+        branch="sandbox/$(date +%Y%m%d-%H%M%S)"
+    fi
+
+    local slug
+    slug="$(slugify "$(basename "$repo_path")")-$(slugify "$branch")"
+    WORKTREE_PATH="${WORKTREE_ROOT}/${slug}"
+
+    # --dry-run must not touch the repo: compute the path, create nothing.
+    if [[ "$DRY_RUN" == true ]]; then
+        return 0
+    fi
+
+    if [[ -d "$WORKTREE_PATH" ]]; then
+        say_ok "Reusing worktree ${C_DIM}${WORKTREE_PATH}${NC}"
+        return 0
+    fi
+
+    mkdir -p "$WORKTREE_ROOT"
+
+    local out
+    if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch"; then
+        out=$(git -C "$repo_path" worktree add "$WORKTREE_PATH" "$branch" 2>&1)
+    else
+        out=$(git -C "$repo_path" worktree add "$WORKTREE_PATH" -b "$branch" 2>&1)
+    fi || {
+        say_err "Could not create worktree: ${out}"
+        return 1
+    }
+
+    WORKTREE_CREATED=true
+    say_ok "Worktree ${C_ACCENT}${branch}${NC} ${C_DIM}(${WORKTREE_PATH})${NC}"
+}
+
+# Where the main repo's .git must appear *inside* the container.
+#
+# A worktree's .git file holds an absolute "gitdir:" path, and git resolves
+# symlinks when writing it — on macOS /tmp and /var are symlinks, so the
+# recorded path rarely equals "$LOCAL_PATH/.git". Read the reference back
+# rather than assuming, or the mount lands somewhere git never looks.
+worktree_gitdir_target() {
+    local ref parent
+    if [[ -f "$WORKTREE_PATH/.git" ]]; then
+        ref=$(sed -n 's/^gitdir: *//p' "$WORKTREE_PATH/.git" 2>/dev/null | head -1)
+        if [[ -n "$ref" && "$ref" == */worktrees/* ]]; then
+            parent="${ref%%/worktrees/*}"
+            [[ -n "$parent" ]] && { echo "$parent"; return 0; }
+        fi
+    fi
+
+    # Not created yet (dry-run): best-effort physical path
+    local physical
+    physical=$(cd "$LOCAL_PATH" 2>/dev/null && pwd -P) || physical="$LOCAL_PATH"
+    echo "${physical}/.git"
+}
+
+# Offer to clean up an untouched worktree; never delete one with work in it.
+cleanup_worktree() {
+    [[ "$WORKTREE_CREATED" == true && -d "$WORKTREE_PATH" ]] || return 0
+
+    local changes commits
+    changes=$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    commits=$(git -C "$WORKTREE_PATH" log --oneline "$(git -C "$LOCAL_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null)".. 2>/dev/null | wc -l | tr -d ' ')
+
+    echo ""
+    if [[ "$changes" == "0" && "$commits" == "0" ]]; then
+        git -C "$LOCAL_PATH" worktree remove --force "$WORKTREE_PATH" 2>/dev/null \
+            && say_dim "Removed empty worktree"
+        return 0
+    fi
+
+    local branch
+    branch=$(git -C "$WORKTREE_PATH" branch --show-current 2>/dev/null)
+    say_ok "Work kept on ${C_ACCENT}${branch}${NC}"
+    echo -e "     ${C_DIM}${commits} commit(s), ${changes} uncommitted file(s)${NC}"
+    echo -e "     ${C_DIM}Review:  ${C_TEXT}git -C $(printf '%q' "$LOCAL_PATH") log ${branch}${NC}"
+    echo -e "     ${C_DIM}Merge:   ${C_TEXT}git -C $(printf '%q' "$LOCAL_PATH") merge ${branch}${NC}"
+    echo -e "     ${C_DIM}Discard: ${C_TEXT}git -C $(printf '%q' "$LOCAL_PATH") worktree remove --force $(printf '%q' "$WORKTREE_PATH")${NC}"
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
@@ -637,13 +1012,15 @@ screen_welcome() {
 
     refresh_gh_user
 
+    # GitHub is optional: plenty of sessions are purely local folders.
     if [[ -z "$GH_USER" ]]; then
         echo ""
-        say_warn "${C_TEXT}No GitHub account found${NC}"
+        say_warn "${C_TEXT}No GitHub account connected${NC}"
+        echo -e "     ${C_DIM}Local repos work fine. Run ${C_TEXT}gh auth login${C_DIM} to clone from GitHub.${NC}"
         echo ""
-        echo -e "  ${C_DIM}Run ${C_TEXT}gh auth login${C_DIM} first${NC}"
-        echo ""
-        exit 1
+        echo -e "  ${C_DIM}Press ${C_TEXT}Enter${C_DIM} to continue...${NC}"
+        read -r
+        return 0
     fi
 
     draw_user_card "$GH_USER"
@@ -663,33 +1040,130 @@ screen_source_select() {
 
     draw_box $w "SELECT SOURCE"
     draw_spacer $w
-    draw_box_row $w "${C_ACCENT}1)${NC} ${C_TEXT}GitHub repository${NC}"
-    draw_box_row $w "${C_DIM}   Clone and work on a remote repo${NC}"
+    draw_box_row $w "${C_ACCENT}1)${NC} ${C_TEXT}Local directory${NC}"
+    draw_box_row $w "${C_DIM}   Work on a folder on this machine${NC}"
     draw_spacer $w
     draw_separator $w
     draw_spacer $w
-    draw_box_row $w "${C_ACCENT}2)${NC} ${C_TEXT}Local directory${NC}"
-    draw_box_row $w "${C_DIM}   Work on a local git repo (no push)${NC}"
+    draw_box_row $w "${C_ACCENT}2)${NC} ${C_TEXT}GitHub repository${NC}"
+    draw_box_row $w "${C_DIM}   Clone and work on a remote repo${NC}"
     draw_spacer $w
     draw_box_bottom $w
     echo ""
 
+    local options=()
+    local recents
+    recents=$(list_recent_workspaces)
+    [[ -n "$recents" ]] && options+=("Recent workspace")
+    options+=("Local directory" "GitHub repository")
+
     local choice
-    choice=$(gum choose --height=4 "GitHub repository" "Local directory")
+    choice=$(printf '%s\n' "${options[@]}" | gum choose --height=5)
 
     case "$choice" in
-        "GitHub repository") LOCAL_MODE=false ;;
+        "Recent workspace")  screen_recent_workspaces ;;
         "Local directory")   LOCAL_MODE=true; screen_local_path ;;
+        "GitHub repository") LOCAL_MODE=false ;;
     esac
 }
 
+screen_recent_workspaces() {
+    local w=56
+
+    clear
+    echo ""
+    draw_mini_logo
+    echo ""
+
+    draw_box $w "RECENT WORKSPACES"
+    draw_spacer $w
+    draw_box_row $w "${C_DIM}  Reopen a previous session with its mounts${NC}"
+    draw_spacer $w
+    draw_box_bottom $w
+    echo ""
+
+    local labels=() paths=() extras=()
+    local label path extra
+    while IFS=$'\t' read -r label path extra; do
+        [[ -z "$label" ]] && continue
+        labels+=("$label")
+        paths+=("$path")
+        extras+=("$extra")
+    done < <(list_recent_workspaces)
+
+    if [[ ${#labels[@]} -eq 0 ]]; then
+        say_dim "No recent workspaces yet"
+        sleep 1
+        LOCAL_MODE=true
+        screen_local_path
+        return
+    fi
+
+    local choice
+    choice=$(printf '%s\n' "${labels[@]}" | gum choose --height=12)
+    [[ -z "$choice" ]] && return
+
+    local i
+    for i in "${!labels[@]}"; do
+        if [[ "${labels[$i]}" == "$choice" ]]; then
+            restore_recent_workspace "${paths[$i]}" "${extras[$i]}"
+            echo ""
+            say_ok "Restored ${C_ACCENT}${SELECTED_REPO}${NC} ${C_DIM}(${#EXTRA_PATHS[@]} extra mount(s))${NC}"
+            sleep 1
+            return
+        fi
+    done
+}
+
+# Mounting several sibling repos is the common case, so offer them as a
+# multi-select instead of making you type each path.
+offer_sibling_mounts() {
+    local parent
+    parent=$(dirname "$LOCAL_PATH")
+    [[ -d "$parent" ]] || return 0
+
+    local siblings=() dir
+    while IFS= read -r dir; do
+        [[ -n "$dir" ]] || continue
+        [[ "$dir" == "$LOCAL_PATH" ]] && continue
+        [[ -e "$dir/.git" ]] || continue
+
+        local already=false ep
+        for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+            [[ "$(mount_path "$ep")" == "$dir" ]] && { already=true; break; }
+        done
+        [[ "$already" == true ]] && continue
+
+        siblings+=("$(basename "$dir")")
+    done < <(find "$parent" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+
+    [[ ${#siblings[@]} -gt 0 ]] || return 0
+
+    echo ""
+    echo -e "  ${C_DIM}Repos next to ${C_TEXT}$(basename "$LOCAL_PATH")${C_DIM} — space to select, enter to confirm, esc to skip${NC}"
+    echo ""
+
+    local picked
+    picked=$(printf '%s\n' "${siblings[@]}" | gum choose --no-limit --height=12 \
+        --header "Mount alongside $(basename "$LOCAL_PATH")?" 2>/dev/null) || return 0
+
+    [[ -n "$picked" ]] || return 0
+
+    local name
+    while IFS= read -r name; do
+        [[ -n "$name" ]] && validate_and_add_extra_path "${parent}/${name}"
+    done <<< "$picked"
+}
+
 prompt_extra_mounts() {
+    offer_sibling_mounts
+
     while true; do
         echo ""
-        gum confirm "Mount additional directories?" || break
+        gum confirm --default=false "Mount another directory (outside $(basename "$(dirname "$LOCAL_PATH")")/)?" || break
 
         local extra_input
-        extra_input=$(gum input --placeholder="Path to another git repo...")
+        extra_input=$(gum input --placeholder="~/path/to/folder   (append :ro for read-only)")
         [[ -z "$extra_input" ]] && break
 
         validate_and_add_extra_path "$extra_input" || sleep 1
@@ -716,8 +1190,7 @@ screen_local_path() {
     path_input=$(gum input --placeholder="." --value=".")
     [[ -z "$path_input" ]] && path_input="."
 
-    path_input="${path_input/#\~/$HOME}"
-    LOCAL_PATH=$(cd "$path_input" 2>/dev/null && pwd) || {
+    LOCAL_PATH=$(abs_path_of "$path_input") || {
         echo ""
         say_err "Directory not found: ${path_input}"
         sleep 2
@@ -725,21 +1198,25 @@ screen_local_path() {
         return
     }
 
-    if [[ ! -e "$LOCAL_PATH/.git" ]]; then
-        echo ""
-        say_err "Not a git repository: ${LOCAL_PATH}"
-        sleep 2
-        LOCAL_MODE=false
-        return
-    fi
+    local root
+    root=$(git_root_of "$LOCAL_PATH") || true
+    [[ -n "$root" ]] && LOCAL_PATH="$root"
 
     SELECTED_REPO=$(basename "$LOCAL_PATH")
 
     echo ""
-    say_ok "Found git repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
+    if [[ -n "$root" ]]; then
+        say_ok "Found git repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
+    else
+        say_warn "Not a git repo: ${C_ACCENT}${SELECTED_REPO}${NC} ${C_DIM}(no branches or auto-save)${NC}"
+        AUTO_GIT=false
+        WORKTREE=false
+    fi
     sleep 1
 
     EXTRA_PATHS=()
+    load_config_file "$LOCAL_PATH/$REPO_CONFIG_FILE"
+    add_mounts_from_config "$LOCAL_PATH"
     prompt_extra_mounts
 }
 
@@ -888,8 +1365,11 @@ draw_launch_summary() {
         draw_spacer $w
         draw_box_row $w "  ${C_DIM}Repository${NC}    ${C_BRIGHT}${SELECTED_REPO}${NC}"
         draw_box_row $w "  ${C_DIM}Path${NC}          ${C_TEXT}${LOCAL_PATH}${NC}"
+        if [[ "$WORKTREE" == true ]]; then
+            draw_box_row $w "  ${C_DIM}Isolation${NC}     ${C_ACCENT}worktree${NC} ${C_DIM}(your checkout untouched)${NC}"
+        fi
         for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
-            draw_box_row $w "  ${C_ACCENT}+ mounted${NC}     ${C_TEXT}${ep##*:}${NC} ${C_DIM}(${ep%%:*})${NC}"
+            draw_box_row $w "  ${C_ACCENT}+ mounted${NC}     ${C_TEXT}$(mount_name "$ep")${NC} ${C_DIM}($(mount_path "$ep"))${NC}"
         done
     else
         draw_box $w "LAUNCH SANDBOX"
@@ -905,10 +1385,20 @@ draw_launch_summary() {
     draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
 
     if [[ "$LOCAL_MODE" == true ]]; then
-        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Local repo mounted (changes persist)${NC}"
+        if [[ "$WORKTREE" == true ]]; then
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Your folders are NOT mounted${NC}"
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Agent works on a scratch branch${NC}"
+        else
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Agent edits your real files, live${NC}"
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Edits survive a container kill${NC}"
+            if [[ "$SNAPSHOT" == true ]]; then
+                draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Snapshot taken (untracked files too)${NC}"
+            fi
+        fi
         draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}No push to remote${NC}"
     else
         draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}SSH keys forwarded (never copied)${NC}"
+        draw_box_row $w "  ${C_WARN}!${NC} ${C_DIM}Clone lives in the container — push to keep${NC}"
     fi
 
     if [[ "$AUTO_GIT" == true ]]; then
@@ -937,7 +1427,22 @@ draw_launch_summary() {
     draw_box_bottom $w
 }
 
+# Where the work lives decides whether auto-save is worth its noise.
+#
+#   local mode  - the repo is a bind mount, so every write is already on the
+#                 host. A killed container loses nothing; auto-save would only
+#                 add "auto-save #47" commits. Off.
+#   github mode - the clone lives inside the container. If it dies, unpushed
+#                 work is gone for good. On.
+apply_autosave_default() {
+    is_explicit AUTO_GIT && return 0
+    if [[ "$LOCAL_MODE" != true ]]; then
+        AUTO_GIT=true
+    fi
+}
+
 screen_launch_confirm() {
+    apply_autosave_default
     clear
     echo ""
     draw_mini_logo
@@ -972,7 +1477,13 @@ screen_launch_confirm() {
 DOCKER_ARGS=()
 
 build_docker_args() {
-    DOCKER_ARGS=(run --rm -it --init)
+    DOCKER_ARGS=(run --rm --init)
+    # Headless runs get stdin but no TTY, so output pipes cleanly
+    if [[ -n "$EXEC_PROMPT" ]]; then
+        DOCKER_ARGS+=(-i)
+    else
+        DOCKER_ARGS+=(-it)
+    fi
 
     CONTAINER_NAME="${CONTAINER_NAME:-$(generate_container_name)}"
     DOCKER_ARGS+=(--name "$CONTAINER_NAME")
@@ -982,6 +1493,7 @@ build_docker_args() {
         --label "${LABEL_NS}.managed=true"
         --label "${LABEL_NS}.version=${VERSION}"
         --label "${LABEL_NS}.repo=${SELECTED_REPO}"
+        --label "${LABEL_NS}.launcher-pid=$$"
     )
     if [[ "$LOCAL_MODE" == true ]]; then
         DOCKER_ARGS+=(--label "${LABEL_NS}.workspace=${LOCAL_PATH}")
@@ -1020,7 +1532,9 @@ build_docker_args() {
         )
     fi
 
-    # Host config mounts (each guarded — only mounted if present)
+    # Host config mounts (each guarded — only mounted if present).
+    # ~/.claude is mounted whole and read-write on purpose: settings, skills,
+    # plugins, session history and resume all depend on it being the real one.
     [[ -d "$HOME/.claude" ]]     && DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.claude")
     [[ -d "$HOME/.ssh" ]]        && DOCKER_ARGS+=(-v "$HOME/.ssh:/home/node/.ssh-host:ro")
     [[ -d "$HOME/.aws" ]]        && DOCKER_ARGS+=(-v "$HOME/.aws:/home/node/.aws")
@@ -1063,13 +1577,32 @@ build_docker_args() {
     gh_token=$(gh auth token 2>/dev/null | tr -d '\n' || echo "")
     [[ -n "$gh_token" ]] && DOCKER_ARGS+=(-e "GH_TOKEN=$gh_token")
 
+    # Headless one-shot run
+    if [[ -n "$EXEC_PROMPT" ]]; then
+        DOCKER_ARGS+=(-e "SANDBOX_EXEC=$EXEC_PROMPT" -e "SANDBOX_AGENT=$AGENT")
+    fi
+
     # Workspace mounts + entrypoint args
     if [[ "$LOCAL_MODE" == true ]]; then
         DOCKER_ARGS+=(-e "LOCAL_MODE=1")
-        DOCKER_ARGS+=(-v "$LOCAL_PATH:/home/node/workspace/$SELECTED_REPO")
+
+        if [[ -n "$WORKTREE_PATH" ]]; then
+            # The worktree's .git file points at an absolute path inside the
+            # main repo; mirror that exact path so git resolves it in-container.
+            DOCKER_ARGS+=(-v "$WORKTREE_PATH:/home/node/workspace/$SELECTED_REPO")
+            DOCKER_ARGS+=(-v "$LOCAL_PATH/.git:$(worktree_gitdir_target)")
+        else
+            DOCKER_ARGS+=(-v "$LOCAL_PATH:/home/node/workspace/$SELECTED_REPO")
+        fi
+
         for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
-            DOCKER_ARGS+=(-v "${ep%%:*}:/home/node/workspace/${ep##*:}")
+            local m_mode="" m_path m_name
+            m_path=$(mount_path "$ep")
+            m_name=$(mount_name "$ep")
+            [[ "$(mount_mode "$ep")" == "ro" ]] && m_mode=":ro"
+            DOCKER_ARGS+=(-v "${m_path}:/home/node/workspace/${m_name}${m_mode}")
         done
+
         DOCKER_ARGS+=("$IMAGE_REF" "--local" "$SELECTED_REPO")
     else
         DOCKER_ARGS+=("$IMAGE_REF" "$SELECTED_REPO_URL")
@@ -1124,19 +1657,33 @@ report_launch_context() {
     if [[ "$LOCAL_MODE" == true ]]; then
         say_ok "Local mode: mounting ${LOCAL_PATH}"
         for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
-            say_ok "Extra mount: ${ep##*:}"
+            say_ok "Extra mount: $(mount_name "$ep") ${C_DIM}[$(mount_mode "$ep")]${NC}"
         done
     fi
 }
 
 launch_sandbox() {
-    if [[ "$DRY_RUN" != true ]]; then
+    local headless=false
+    [[ -n "$EXEC_PROMPT" ]] && headless=true
+
+    if [[ "$DRY_RUN" != true && "$headless" != true ]]; then
         clear
         echo ""
         draw_mini_logo
         echo ""
         echo -e "  ${C_ACCENT}▸${NC} Preparing sandbox..."
     fi
+
+    if [[ "$WORKTREE" == true && "$LOCAL_MODE" == true ]]; then
+        setup_worktree "$LOCAL_PATH" "$SANDBOX_BRANCH" || return 1
+        # The branch already exists in the worktree; don't switch again inside
+        SANDBOX_BRANCH=""
+    elif [[ "$WORKTREE" == true ]]; then
+        say_warn "--worktree only applies to local repos; ignoring"
+    fi
+
+    # Snapshot every writable repo in the session before handing over control
+    [[ "$DRY_RUN" == true ]] || snapshot_all_repos
 
     resolve_image
     build_docker_args
@@ -1146,21 +1693,34 @@ launch_sandbox() {
         return 0
     fi
 
-    report_launch_context
+    [[ "$headless" == true ]] || report_launch_context
+    remember_workspace
 
-    echo -e "  ${C_ACCENT}▸${NC} Launching ${C_ACCENT}${CONTAINER_NAME}${NC}..."
-    echo ""
+    if [[ "$headless" != true ]]; then
+        echo -e "  ${C_ACCENT}▸${NC} Launching ${C_ACCENT}${CONTAINER_NAME}${NC}..."
+        echo ""
+    fi
 
     docker "${DOCKER_ARGS[@]}"
+    local exit_code=$?
+
+    if [[ "$headless" == true ]]; then
+        cleanup_worktree
+        return $exit_code
+    fi
 
     echo ""
     say_ok "${C_TEXT}Container destroyed${NC}"
-    if [[ "$LOCAL_MODE" == true ]]; then
-        echo -e "  ${C_DIM}  Your changes are on a local branch${NC}"
+    if [[ -n "$WORKTREE_PATH" ]]; then
+        cleanup_worktree
+    elif [[ "$LOCAL_MODE" == true ]]; then
+        echo -e "  ${C_DIM}  Your changes are in ${LOCAL_PATH}${NC}"
+        report_snapshot
     else
         echo -e "  ${C_DIM}  Your changes are safely on GitHub${NC}"
     fi
     echo ""
+    return $exit_code
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
@@ -1185,7 +1745,7 @@ screen_main_menu() {
                 draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Repository${NC}    ${C_TEXT}${SELECTED_REPO}${NC}"
                 draw_box_row $w "  ${C_DIM}  ${NC} ${C_DIM}Path${NC}          ${C_DIM}${LOCAL_PATH}${NC}"
                 for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
-                    draw_box_row $w "  ${C_ACCENT}  ${NC} ${C_DIM}+ mounted${NC}     ${C_TEXT}${ep##*:}${NC}"
+                    draw_box_row $w "  ${C_ACCENT}  ${NC} ${C_DIM}+ mounted${NC}     ${C_TEXT}$(mount_name "$ep")${NC}"
                 done
             else
                 draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Repository${NC}    ${C_DIM}None selected${NC}"
@@ -1407,20 +1967,32 @@ cmd_kill() {
     say_ok "Killed ${name}"
 }
 
-# A sandbox whose terminal is gone still holds mounts and can keep auto-committing.
+# A sandbox whose terminal is gone still holds mounts and can keep
+# auto-committing. Each container records the PID of the cs process that
+# launched it, so this is an exact check rather than grepping the process
+# table for something that looks close enough.
 cmd_orphans() {
-    local clients
-    clients=$(ps -axo command 2>/dev/null | grep -E "docker (run|exec|attach)" | grep -v grep || true)
-
-    local found=0 id name
+    local found=0 id name pid cmd
     for id in $(list_sandbox_ids); do
         name=$(docker inspect --format '{{.Name}}' "$id" | sed 's|^/||')
-        if grep -qF -- "$name" <<< "$clients"; then
-            printf "  %-22s ${C_SUCCESS}attached${NC}\n" "$name"
-        else
-            printf "  %-22s ${C_WARN}ORPHAN${NC} ${C_DIM}(no docker client found)${NC}\n" "$name"
-            found=1
+        pid=$(docker inspect --format "{{index .Config.Labels \"${LABEL_NS}.launcher-pid\"}}" "$id" 2>/dev/null || echo "")
+
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            # Guard against PID reuse: the live process must still be ours
+            cmd=$(ps -p "$pid" -o command= 2>/dev/null || echo "")
+            if [[ "$cmd" == *claude-sandbox* || "$cmd" == *"/cs"* ]]; then
+                printf "  %-22s ${C_SUCCESS}attached${NC}\n" "$name"
+                continue
+            fi
         fi
+
+        if [[ -z "$pid" ]]; then
+            printf "  %-22s ${C_DIM}unknown${NC} ${C_DIM}(started outside cs)${NC}\n" "$name"
+            continue
+        fi
+
+        printf "  %-22s ${C_WARN}ORPHAN${NC} ${C_DIM}(launcher gone)${NC}\n" "$name"
+        found=1
     done
 
     if [[ "$found" == "1" ]]; then
@@ -1430,6 +2002,61 @@ cmd_orphans() {
     elif [[ -z "$(list_sandbox_ids)" ]]; then
         say_dim "No running sandboxes"
     fi
+}
+
+# Headless one-shot: run an agent with a prompt, print its output, exit.
+# The primitive that scripting, CI and multi-agent workflows build on.
+cmd_exec() {
+    POSITIONAL=()
+    parse_args "$@"
+    set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+
+    [[ $# -ge 1 ]] || die "Usage: claude-sandbox exec \"<prompt>\" [path] [--agent claude|codex]"
+
+    EXEC_PROMPT="$1"
+    shift
+    QUIET=true
+    ASSUME_YES=true
+
+    local target="${1:-.}"
+    [[ $# -gt 0 ]] && shift
+    resolve_target "$target"
+
+    for extra in "$@"; do
+        validate_and_add_extra_path "$extra" || true
+    done
+
+    launch_sandbox
+}
+
+# If a container died before its worktree could be reported, this is how you
+# find the work again.
+cmd_worktrees() {
+    local found=0 wt branch changes repo
+
+    if [[ ! -d "$WORKTREE_ROOT" ]]; then
+        say_dim "No sandbox worktrees"
+        return 0
+    fi
+
+    while IFS= read -r wt; do
+        [[ -n "$wt" && -e "$wt/.git" ]] || continue
+        found=1
+        branch=$(git -C "$wt" branch --show-current 2>/dev/null || echo "?")
+        changes=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        repo=$(sed -n 's/^gitdir: *//p' "$wt/.git" 2>/dev/null | sed 's#/\.git/worktrees/.*##')
+
+        echo -e "  ${C_ACCENT}${branch}${NC}"
+        echo -e "    ${C_DIM}path:  ${wt}${NC}"
+        [[ -n "$repo" ]] && echo -e "    ${C_DIM}repo:  ${repo}${NC}"
+        if [[ "$changes" != "0" ]]; then
+            echo -e "    ${C_WARN}${changes} uncommitted file(s)${NC}"
+        fi
+        [[ -n "$repo" ]] && echo -e "    ${C_DIM}merge: ${C_TEXT}git -C $(printf '%q' "$repo") merge ${branch}${NC}"
+    done < <(find "$WORKTREE_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+
+    [[ "$found" == "0" ]] && say_dim "No sandbox worktrees"
+    return 0
 }
 
 cmd_doctor() {
@@ -1567,6 +2194,7 @@ detect_current_repo() {
         SELECTED_REPO=$(basename "$repo_root")
         EXTRA_PATHS=()
         load_config_file "$LOCAL_PATH/$REPO_CONFIG_FILE"
+        add_mounts_from_config "$LOCAL_PATH"
         prompt_extra_mounts
     fi
 }
@@ -1620,10 +2248,12 @@ ${C_TEXT}${BOLD}TARGETS${NC}
 
 ${C_TEXT}${BOLD}COMMANDS${NC}
   ${C_ACCENT}run${NC} <target>              ${C_DIM}Launch a sandbox (default command)${NC}
+  ${C_ACCENT}exec${NC} "<prompt>" [path]    ${C_DIM}Run an agent headlessly and print the result${NC}
   ${C_ACCENT}ps${NC}                        ${C_DIM}List running sandboxes and their mounts${NC}
   ${C_ACCENT}attach${NC} [name]             ${C_DIM}Open a second shell in a sandbox${NC}
   ${C_ACCENT}kill${NC} [name|--all]         ${C_DIM}Stop sandboxes${NC}
   ${C_ACCENT}orphans${NC}                   ${C_DIM}Find sandboxes whose terminal is gone${NC}
+  ${C_ACCENT}worktrees${NC}                 ${C_DIM}Find work left in sandbox worktrees${NC}
   ${C_ACCENT}doctor${NC}                    ${C_DIM}Check host setup${NC}
   ${C_ACCENT}update${NC}                    ${C_DIM}Pull or rebuild the sandbox image${NC}
   ${C_ACCENT}version${NC}                   ${C_DIM}Print version${NC}
@@ -1631,14 +2261,18 @@ ${C_TEXT}${BOLD}COMMANDS${NC}
 
 ${C_TEXT}${BOLD}LAUNCH OPTIONS${NC}
   ${C_ACCENT}-y, --yes${NC}                 ${C_DIM}Skip all prompts, use defaults${NC}
+  ${C_ACCENT}-w, --worktree${NC}            ${C_DIM}Work in a git worktree — your checkout is never touched${NC}
   ${C_ACCENT}-b, --branch${NC} <name>       ${C_DIM}Check out/create branch in the sandbox${NC}
-  ${C_ACCENT}-m, --mount${NC} <path>        ${C_DIM}Mount an extra local repo (repeatable)${NC}
+  ${C_ACCENT}-m, --mount${NC} <path[:ro]>   ${C_DIM}Mount another folder, optionally read-only${NC}
   ${C_ACCENT}-n, --name${NC} <name>         ${C_DIM}Container name (default: cs-<repo>)${NC}
+  ${C_ACCENT}    --agent${NC} <name>        ${C_DIM}Agent for exec: claude (default) or codex${NC}
   ${C_ACCENT}    --auto-git${NC}            ${C_DIM}Auto-commit every N seconds (off by default)${NC}
   ${C_ACCENT}    --no-auto-git${NC}         ${C_DIM}Disable auto-commit${NC}
   ${C_ACCENT}    --interval${NC} <secs>     ${C_DIM}Auto-commit interval (default 60)${NC}
   ${C_ACCENT}    --browser${NC}             ${C_DIM}Enable headless Chromium + Playwright MCP${NC}
   ${C_ACCENT}    --update-tools${NC}        ${C_DIM}Update Claude Code and Codex on start${NC}
+  ${C_ACCENT}    --snapshot${NC}            ${C_DIM}Record the working tree first, so an agent${NC}
+  ${C_ACCENT}${NC}                           ${C_DIM}deleting an untracked file is recoverable${NC}
   ${C_ACCENT}    --network${NC} <mode>      ${C_DIM}host (default) or bridge${NC}
   ${C_ACCENT}-p, --publish${NC} <a:b>       ${C_DIM}Publish a port (implies bridge)${NC}
   ${C_ACCENT}    --image${NC} <ref>         ${C_DIM}Use a specific image${NC}
@@ -1646,15 +2280,21 @@ ${C_TEXT}${BOLD}LAUNCH OPTIONS${NC}
   ${C_ACCENT}    --dry-run${NC}             ${C_DIM}Print the docker command and exit${NC}
 
 ${C_TEXT}${BOLD}CONFIG${NC}
-  ${C_DIM}Global:${NC}  ${CONFIG_FILE}
+  ${C_DIM}Global:${NC}   ${CONFIG_FILE}
   ${C_DIM}Per-repo:${NC} ./${REPO_CONFIG_FILE}  ${C_DIM}(KEY=value; parsed, never sourced)${NC}
-  ${C_DIM}Keys:${NC}    ${CONFIG_KEYS}
+  ${C_DIM}Keys:${NC}     ${CONFIG_KEYS}
+
+  ${C_DIM}A repo that always needs its siblings — commit this and stop retyping:${NC}
+    ${C_TEXT}MOUNTS=../api,../web,~/notes:ro${NC}
+    ${C_TEXT}WORKTREE=true${NC}
 
 ${C_TEXT}${BOLD}EXAMPLES${NC}
   ${C_DIM}cs .                              ${NC}${C_DIM}# sandbox the current repo${NC}
-  ${C_DIM}cs . -y --browser                 ${NC}${C_DIM}# no prompts, with a browser${NC}
-  ${C_DIM}cs . -m ~/work/api -m ~/work/web  ${NC}${C_DIM}# multi-repo session${NC}
+  ${C_DIM}cs . -w                           ${NC}${C_DIM}# worktree: your checkout stays clean${NC}
+  ${C_DIM}cs . -m ~/work/api -m ~/docs:ro   ${NC}${C_DIM}# multi-folder, one read-only${NC}
+  ${C_DIM}cs ~/scratch                      ${NC}${C_DIM}# a plain folder works too${NC}
   ${C_DIM}cs owner/repo -b feature/login    ${NC}${C_DIM}# clone and start on a branch${NC}
+  ${C_DIM}cs exec "run the tests"           ${NC}${C_DIM}# headless, prints to stdout${NC}
   ${C_DIM}cs . --dry-run                    ${NC}${C_DIM}# see the exact docker command${NC}
 
 EOF
@@ -1673,17 +2313,22 @@ parse_args() {
             -b|--branch)     SANDBOX_BRANCH="${2:?--branch needs a value}"; shift 2 ;;
             -m|--mount)      POSITIONAL+=("${2:?--mount needs a path}"); shift 2 ;;
             -n|--name)       CONTAINER_NAME="${2:?--name needs a value}"; shift 2 ;;
-            --auto-git)      AUTO_GIT=true; shift ;;
-            --no-auto-git)   AUTO_GIT=false; shift ;;
-            --interval)      AUTO_GIT_INTERVAL="${2:?--interval needs a value}"; shift 2 ;;
-            --browser)       BROWSER=true; shift ;;
-            --no-browser)    BROWSER=false; shift ;;
-            --update-tools)  UPDATE_TOOLS=true; shift ;;
-            --network)       NETWORK="${2:?--network needs a value}"; shift 2 ;;
-            -p|--publish)    PUBLISH_PORTS+=("${2:?--publish needs a value}"); NETWORK="bridge"; shift 2 ;;
-            --image)         IMAGE_REF="${2:?--image needs a value}"; shift 2 ;;
-            --pull)          PULL_POLICY="always"; shift ;;
-            --no-pull)       PULL_POLICY="never"; shift ;;
+            -w|--worktree)   WORKTREE=true; mark_explicit WORKTREE; shift ;;
+            --no-worktree)   WORKTREE=false; mark_explicit WORKTREE; shift ;;
+            --agent)         AGENT="${2:?--agent needs a value}"; mark_explicit AGENT; shift 2 ;;
+            --snapshot)      SNAPSHOT=true; mark_explicit SNAPSHOT; shift ;;
+            --no-snapshot)   SNAPSHOT=false; mark_explicit SNAPSHOT; shift ;;
+            --auto-git)      AUTO_GIT=true; mark_explicit AUTO_GIT; shift ;;
+            --no-auto-git)   AUTO_GIT=false; mark_explicit AUTO_GIT; shift ;;
+            --interval)      AUTO_GIT_INTERVAL="${2:?--interval needs a value}"; mark_explicit AUTO_GIT_INTERVAL; shift 2 ;;
+            --browser)       BROWSER=true; mark_explicit BROWSER; shift ;;
+            --no-browser)    BROWSER=false; mark_explicit BROWSER; shift ;;
+            --update-tools)  UPDATE_TOOLS=true; mark_explicit UPDATE_TOOLS; shift ;;
+            --network)       NETWORK="${2:?--network needs a value}"; mark_explicit NETWORK; shift 2 ;;
+            -p|--publish)    PUBLISH_PORTS+=("${2:?--publish needs a value}"); NETWORK="bridge"; mark_explicit NETWORK; shift 2 ;;
+            --image)         IMAGE_REF="${2:?--image needs a value}"; mark_explicit IMAGE_REF; shift 2 ;;
+            --pull)          PULL_POLICY="always"; mark_explicit PULL_POLICY; shift ;;
+            --no-pull)       PULL_POLICY="never"; mark_explicit PULL_POLICY; shift ;;
             --dry-run)       DRY_RUN=true; ASSUME_YES=true; shift ;;
             -h|--help)       show_help; exit 0 ;;
             -v|--version)    echo "claude-sandbox ${VERSION}"; exit 0 ;;
@@ -1700,12 +2345,27 @@ resolve_target() {
 
     if [[ "$input" == "." || "$input" == ".." || "$input" == /* || "$input" == ~* || -d "$input" ]]; then
         LOCAL_MODE=true
-        input="${input/#\~/$HOME}"
-        LOCAL_PATH=$(cd "$input" 2>/dev/null && pwd) || die "Directory not found: ${input}"
-        [[ -e "$LOCAL_PATH/.git" ]] || die "Not a git repository: ${LOCAL_PATH}"
+        LOCAL_PATH=$(abs_path_of "$input") || die "Directory not found: ${input}"
+
+        # Running from a subdirectory should sandbox the whole repo
+        local root
+        root=$(git_root_of "$LOCAL_PATH") || true
+        if [[ -n "$root" && "$root" != "$LOCAL_PATH" ]]; then
+            [[ "$DRY_RUN" == true ]] || say_dim "Using repo root ${root}"
+            LOCAL_PATH="$root"
+        fi
 
         SELECTED_REPO=$(basename "$LOCAL_PATH")
+
+        if [[ -z "$root" ]]; then
+            # Not a git repo: still useful to sandbox, just say so plainly
+            [[ "$DRY_RUN" == true ]] || say_warn "Not a git repo — no branches, no auto-save: ${C_DIM}${LOCAL_PATH}${NC}"
+            AUTO_GIT=false
+            WORKTREE=false
+        fi
+
         load_config_file "$LOCAL_PATH/$REPO_CONFIG_FILE"
+        add_mounts_from_config "$LOCAL_PATH"
         [[ "$DRY_RUN" == true ]] || say_ok "Local repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
         return 0
     fi
@@ -1731,9 +2391,11 @@ main() {
     # Dispatch management subcommands before generic parsing
     case "${1:-}" in
         ps)      shift; check_deps; cmd_ps "$@"; exit 0 ;;
+        exec)    shift; check_deps; cmd_exec "$@"; exit $? ;;
         attach)  shift; check_deps; cmd_attach "${1:-}"; exit 0 ;;
         kill)    shift; check_deps; parse_args "$@"; cmd_kill "${POSITIONAL[0]:-${1:-}}"; exit 0 ;;
         orphans) shift; check_deps; cmd_orphans; exit 0 ;;
+        worktrees) shift; cmd_worktrees; exit 0 ;;
         doctor)  shift; cmd_doctor; exit 0 ;;
         update)  shift; check_deps; parse_args "$@"; cmd_update; exit 0 ;;
         version) echo "claude-sandbox ${VERSION}"; exit 0 ;;

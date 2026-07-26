@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work koalaman/shellcheck:stable \
+            --severity=warning \
+            claude-sandbox install.sh runtime/entrypoint.sh runtime/auto-git.sh tests/image-smoke.sh
+
+      - name: hadolint
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work hadolint/hadolint hadolint \
+            --ignore DL3008 --ignore DL3013 --ignore DL4006 --ignore DL3003 Dockerfile
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bats
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work --entrypoint sh bats/bats:latest \
+            -c 'apk add --no-cache git >/dev/null 2>&1; exec bats tests/unit'
+
+  image:
+    name: Build & smoke-test image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (amd64 only for speed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: claude-sandbox:ci
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: IMAGE=claude-sandbox:ci ./tests/image-smoke.sh
+
+      - name: CLI dry-run produces a valid docker command
+        run: |
+          set -euo pipefail
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+          out=$(./claude-sandbox . --dry-run --no-pull --image claude-sandbox:ci)
+          echo "$out"
+          # Never leak secrets, always target the sandbox image
+          grep -q -- "--label com.claude-sandbox.managed=true" <<<"$out"
+          grep -q -- "claude-sandbox:ci" <<<"$out"
+          ! grep -qiE "(ghp_|sk-ant-)[A-Za-z0-9]" <<<"$out"
