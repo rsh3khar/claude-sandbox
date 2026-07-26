@@ -139,18 +139,25 @@ rm -rf "$execdir"
 wtdir="$(cd "$(mktemp -d)" && pwd -P)"
 
 # Setup failures used to be swallowed by `>/dev/null 2>&1`, so a git error on a
-# CI runner surfaced only as "exit code 128" with no clue which command.
-if ! wt_setup=$(
-        cd "$wtdir" &&
-        mkdir main &&
-        cd main &&
-        git init -q &&
-        echo hi > a.txt &&
-        git add -A &&
-        git -c user.email=t@t -c user.name=t commit -qm init &&
-        git worktree add -q "$wtdir/tree" -b agent-work
-    2>&1); then
-    bad "worktree test setup failed: $(printf '%s' "$wt_setup" | tr '\n' ' ' | head -c 200)"
+# CI runner surfaced only as "exit code 128" with no clue which command. Capture
+# the status explicitly rather than relying on `if !`, and print a marker so the
+# log shows how far we got even if the shell dies anyway.
+printf "  … worktree setup\n"
+wt_rc=0
+wt_setup=$( {
+    cd "$wtdir" &&
+    mkdir main &&
+    cd main &&
+    git init -q &&
+    echo hi > a.txt &&
+    git add -A &&
+    git -c user.email=t@t -c user.name=t commit -qm init &&
+    git worktree add -q "$wtdir/tree" -b agent-work
+} 2>&1 ) || wt_rc=$?
+printf "  … worktree setup rc=%s\n" "$wt_rc"
+
+if [[ "$wt_rc" -ne 0 ]]; then
+    bad "worktree setup failed (rc=$wt_rc): $(printf '%s' "$wt_setup" | tr '\n' ' ' | head -c 200)"
     rm -rf "$wtdir"
     wtdir=""
 fi
