@@ -1243,21 +1243,21 @@ setup() {
 
 @test "dry-run does not require gum" {
     DRY_RUN=true; ASSUME_YES=true; EXEC_PROMPT=""
-    command -v() { [[ "$1" == "docker" ]]; }   # only docker present
+    command() { [[ "$1" == "-v" && "$2" == "docker" ]]; }   # only docker present
     run check_deps
     [ "$status" -eq 0 ]
 }
 
 @test "exec does not require gum" {
     DRY_RUN=false; ASSUME_YES=false; EXEC_PROMPT="do a thing"
-    command -v() { [[ "$1" == "docker" ]]; }
+    command() { [[ "$1" == "-v" && "$2" == "docker" ]]; }
     run check_deps
     [ "$status" -eq 0 ]
 }
 
 @test "interactive use does require gum" {
     DRY_RUN=false; ASSUME_YES=false; EXEC_PROMPT=""
-    command -v() { [[ "$1" == "docker" ]]; }
+    command() { [[ "$1" == "-v" && "$2" == "docker" ]]; }
     clear_screen() { :; }
     run check_deps
     [ "$status" -ne 0 ]
@@ -1266,7 +1266,7 @@ setup() {
 
 @test "docker is always required" {
     DRY_RUN=true; ASSUME_YES=true; EXEC_PROMPT=""
-    command -v() { return 1; }
+    command() { return 1; }
     clear_screen() { :; }
     run check_deps
     [ "$status" -ne 0 ]

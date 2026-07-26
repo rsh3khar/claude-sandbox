@@ -1,61 +1,46 @@
 # Claude Sandbox
 
-Run [Claude Code](https://claude.ai/code) and [Codex](https://developers.openai.com/codex/cli) with every approval prompt disabled, inside a container you can throw away.
+Run [Claude Code](https://claude.ai/code) and [Codex](https://developers.openai.com/codex/cli) with approvals disabled, in a container you can throw away.
 
 ![Claude Sandbox](screenshot.png)
 
 ## Why
 
-`--dangerously-skip-permissions` is the most useful and most alarming flag in Claude Code. An agent that never stops to ask is dramatically more productive, and also one bad command away from your home directory. Claude Sandbox gives the agent a container to be reckless in.
+`--dangerously-skip-permissions` is worth having and worth fencing off. This is the fence.
 
-- **No prompts** — agents run fully unattended
-- **Disposable** — the container is destroyed on exit
-- **Your credentials work** — SSH agent, GitHub CLI, AWS SSO, all forwarded, none copied
-- **Local-first** — sandbox any folder on your machine, or clone from GitHub
-- **Your checkout stays clean** — `--worktree` gives the agent its own branch and directory
+- No approval prompts
+- Container destroyed on exit
+- SSH agent, `gh` token and `~/.aws` forwarded, not copied
+- Any local folder, or a GitHub clone
+- `--worktree` keeps your checkout out of it
 
-## What this protects against (and what it doesn't)
+## Scope
 
-Be clear-eyed about this, because the distinction matters.
+Covers accidents: a wrong `rm -rf`, a migration against the wrong database, a dependency that rewrites your dotfiles.
 
-**It protects against accidents.** A wrong `rm -rf`, a migration against the wrong database, a runaway build, an `npm install` of something awful, a dependency that decides to rewrite your dotfiles. The blast radius is a container that ceases to exist when you close the terminal.
+Does not contain a hostile agent, because it forwards what one would want:
 
-**It does not contain a hostile agent.** To be useful, the sandbox forwards real credentials:
+| Forwarded | Reach |
+|---|---|
+| SSH agent socket | any repo your key can push to |
+| `GH_TOKEN` from `gh` | GitHub, at your token's scope |
+| `~/.aws` | any profile with a live session |
+| `~/.claude` | read-write, including hooks that later run on the host |
+| `--network host` | anything your machine can reach, localhost included |
 
-| Mounted / forwarded | Why | What an agent could do with it |
-|---|---|---|
-| SSH agent socket | git push | Sign as you — push to any repo your key can reach |
-| `GH_TOKEN` from `gh` | GitHub CLI | Act as you on GitHub, at whatever scope your token has |
-| `~/.aws` | AWS SSO | Use any profile with an active session |
-| `~/.claude` | settings, skills, plugins | Edit config and hooks that later run on your **host** |
-| `--network host` | dev servers "just work" | Reach anything your machine can, including localhost services |
+For untrusted code or untrusted input, use a VM or Claude Code's [native sandboxing](https://code.claude.com/docs/en/sandboxing) with a network allowlist.
 
-So: **a compromised or prompt-injected agent inside this sandbox is not contained.** If you are running untrusted code or processing untrusted input, this is the wrong tool — use an isolated VM, or Claude Code's [native sandboxing](https://code.claude.com/docs/en/sandboxing) with a network allowlist.
+`~/.claude` is mounted whole and read-write deliberately: skills, plugins, session history and `--resume` need the real thing.
 
-`~/.claude` is mounted whole and read-write on purpose — settings, skills, plugins, session history and `--resume` all need the real thing.
+Host file permissions are never modified. `-m path:ro` mounts read-only. `--worktree` doesn't mount your working tree at all.
 
-What Claude Sandbox does give you:
+### Linux: uid 1000 only
 
-- Host **file permissions are never modified**. (An earlier version ran `chmod -R 777` across the workspace, which in local mode propagated straight to your real repository. Fixed, and there's a test.)
-- Mounted folders can be made **read-only** with `-m path:ro`.
-- With `--worktree`, your working tree is **not mounted at all** — the agent works on a scratch branch in a separate directory.
-
-### Known limitation on Linux hosts
-
-The container runs as uid 1000. If your Linux user is a different uid, the agent
-cannot write to your bind-mounted folders — the files belong to you, not to it.
-macOS is unaffected (Docker Desktop and OrbStack map ownership), and most Linux
-single-user installs are uid 1000. If you hit it, `id -u` will show something
-other than 1000; run the sandbox from an account that is uid 1000, or open an
-issue and I will add uid remapping.
+The container runs as uid 1000, so bind mounts owned by another uid aren't writable. macOS maps ownership and is unaffected. Open an issue if you need uid remapping.
 
 ## Requirements
 
-- **Docker** — [OrbStack](https://orbstack.dev/) (recommended) or Docker Desktop
-- **macOS** or **Linux**
-- `gh`, `gum`, `jq` — the installer offers to install these
-- `fzf` — optional, adds the drill-down folder browser with previews
-- A Claude Code subscription or API key
+Docker ([OrbStack](https://orbstack.dev/) or Docker Desktop), macOS or Linux, and a Claude Code subscription or API key. The installer offers to install `gh`, `gum` and `jq`. `fzf` is optional; it makes the folder picker filterable with a preview pane.
 
 ## Install
 
@@ -63,43 +48,41 @@ issue and I will add uid remapping.
 curl -fsSL https://raw.githubusercontent.com/rsh3khar/claude-sandbox/main/install.sh | bash
 ```
 
-This installs a pinned release, verifies it against the published `SHA256SUMS`, and pulls the prebuilt multi-arch image from GHCR (falling back to a local build if the registry is unreachable).
+Installs a pinned release verified against its published `SHA256SUMS`, then pulls the multi-arch image from GHCR, falling back to a local build if the registry is unreachable.
 
 ```bash
-./install.sh --version v0.3.0   # pin a specific release
-./install.sh --no-pull          # always build the image locally
+./install.sh --version v0.3.0   # pin a release
+./install.sh --no-pull          # always build locally
 ./install.sh --link             # dev mode: symlink to a clone
 ./install.sh --uninstall
 ```
-
-`cs` starts instantly. The GitHub identity is looked up only when you actually reach for GitHub — a local session never contacts it.
 
 ## Usage
 
 ### Local folders
 
 ```bash
-cs .                      # sandbox the current repo (from any subdirectory)
-cs . ~/work/api ~/notes   # …with extra folders, straight from the command line
-cs ~/projects/my-app      # any folder — git or not
-cs . -w                   # worktree mode: your checkout is never touched
-cs . -m ~/work/api -m ~/notes:ro    # mount siblings, some read-only
+cs .                      # the current repo, from any subdirectory
+cs . ~/work/api ~/notes   # with extra folders
+cs ~/projects/my-app      # any folder, git or not
+cs . -w                   # worktree mode
+cs . -m ~/work/api -m ~/notes:ro
 ```
 
-Interactively, `cs` finds every git repo near the one you picked — its siblings *and* its cousins, so `~/work/api`, `~/work/team-b/web` and `~/side/notes` all show up in one list. Type a few letters, `tab` to select several, enter. The picker is a loop — add a few repos, browse for a non-git folder, type a path, repeat, then pick `Done`. `Browse folders` opens a two-pane picker over everything from `~` down: folders on the left, a live preview of the highlighted one on the right, git repos marked `[repo]`. Type to narrow, `space` or `tab` to mark as many as you like from anywhere in the list, enter takes them all. Pick `Browse folders (read-only)` to mount that batch read-only. Non-git folders — notes, data, design assets — mount fine this way. Needs `fzf`; without it you get a plain single-column list.
+Interactively, `cs` lists every git repo near the one you picked — siblings and cousins both, so `~/work/api`, `~/work/team-b/web` and `~/side/notes` land in one list. Type to filter, `tab` or `space` to mark several, enter to take them.
 
-Tune the search if your repos live elsewhere or nest deeply:
+The menu loops until you pick `Done`, so a session can mix marked repos, browsed folders and typed paths. `Browse folders` is one flat filterable list from `~` down, repos marked `[repo]`, with a preview of the highlighted folder; the read-only variant mounts that batch `:ro`. `Remove a mount` drops one after the fact.
+
+Recent workspaces are remembered with their mounts.
+
+If your repos live elsewhere or nest deeply:
 
 ```ini
 REPO_ROOTS=~/knowledge,~/clients   # extra trees to search
 REPO_DEPTH=5                       # default 5; ~/work/<group>/<area>/<repo> needs 4+
 ```
 
-Marked the wrong folder? `space` un-marks it inside the picker, and `Remove a mount` in the menu drops one after it has been added.
-
-Recent workspaces are remembered along with their mounts, so a multi-repo session is one pick away next time.
-
-A repo that always needs the same companions can say so once. Commit a `.claude-sandbox` file:
+A repo that always needs the same companions can commit a `.claude-sandbox`:
 
 ```ini
 MOUNTS=../api,../web,~/design-docs:ro
@@ -107,7 +90,7 @@ WORKTREE=true
 BROWSER=true
 ```
 
-Config files are **parsed, not sourced** — a `.claude-sandbox` in a repo you just cloned cannot run code on your machine.
+Config files are parsed, not sourced.
 
 ### GitHub repos
 
@@ -124,7 +107,7 @@ cs exec "run the test suite and summarize failures"
 cs exec "review the diff on this branch" ~/work/api --agent codex
 ```
 
-Only the agent's output goes to stdout, so it pipes and scripts cleanly.
+Only the agent's output reaches stdout.
 
 ### Managing sandboxes
 
@@ -149,44 +132,37 @@ x    # codex, permissions off
 cs . --worktree
 ```
 
-The agent gets a git worktree on a scratch branch. Your working tree is never mounted, so it cannot be dirtied — but commits land in your repo's object store, so on the host:
+The agent gets a worktree on a scratch branch; your working tree is never mounted, but commits land in your object store:
 
 ```bash
-git log sandbox/20260726-143022     # review what the agent did
-git merge sandbox/20260726-143022   # keep it
+git log sandbox/20260726-143022
+git merge sandbox/20260726-143022
 ```
 
-On exit, an untouched worktree is removed automatically; one with work in it is kept, and the exact review/merge/discard commands are printed.
+On exit an untouched worktree is removed, one with work in it is kept, and the review/merge/discard commands are printed.
 
 ## Auto-save
 
-Off by default — a commit every 60 seconds buries real history under dozens of `auto-save #N` commits.
+Off by default — a commit a minute buries real history under `auto-save #N`.
 
 ```bash
 cs . --auto-git --interval 120
 ```
 
-When enabled it commits only when there are changes, and refuses to commit during a merge, rebase, cherry-pick, or on a detached HEAD.
+It skips no-op commits, and won't commit mid-merge, mid-rebase, mid-cherry-pick or on a detached HEAD.
 
-## What happens to your local folders
+## Local folders are bind-mounted
 
-They are bind-mounted, which means the agent edits **your real files, live** — that is the point, and it is why changes show up in your editor immediately.
+Edits and deletes hit your disk as they happen, so killing the sandbox loses nothing and untracked files it removes are gone.
 
-Two consequences worth being clear about:
-
-- **Killing the sandbox loses nothing.** Writes go straight to your disk as they happen; there is no copy to lose. Uncommitted work is still there afterwards.
-- **The agent can delete things for real.** `rm` inside the container removes the file from your disk. Committed files come back with `git checkout`; *untracked* files have nothing to come back from.
-
-If you routinely have untracked work you would miss, `--snapshot` records the working tree (including untracked files, excluding gitignored ones) to `refs/claude-sandbox/pre-session/<ts>` before starting. It never touches HEAD, your index, your working tree or your stash, and restore commands are printed on exit:
+`--snapshot` records the working tree — untracked included, gitignored excluded — to `refs/claude-sandbox/pre-session/<ts>` beforehand, touching neither HEAD, index, working tree nor stash:
 
 ```bash
 cs . --snapshot
 # later
-git diff --stat <ref>                     # what did this session change?
-git checkout <ref> -- path/to/file        # bring one file back
+git diff --stat <ref>
+git checkout <ref> -- path/to/file
 ```
-
-Off by default — most sessions do not need it.
 
 ## Options
 
@@ -201,7 +177,7 @@ Off by default — most sessions do not need it.
 | `--auto-git` / `--interval <s>` | Periodic commits |
 | `--browser` | Headless Chromium + Playwright MCP |
 | `--update-tools` | Update agent CLIs at startup |
-| `--snapshot` | Record the working tree first (see below) |
+| `--snapshot` | Record the working tree first |
 | `REPO_ROOTS=` (config) | Extra trees to search when picking mounts |
 | `--network <mode>` / `-p a:b` | Networking |
 | `--image <ref>` / `--pull` / `--no-pull` | Image selection |
@@ -232,36 +208,34 @@ Containers are labelled `com.claude-sandbox.managed=true`, which is how `ps`, `a
 
 ## Development
 
-Everything runs through Docker — no host tooling to install.
-
 ```bash
-make check        # lint + format check + unit tests
-make test         # bats unit tests (no Docker daemon needed)
+make check        # lint + unit tests + portability (run before pushing)
+make test         # bats unit tests, no Docker daemon needed
 make build        # build the image
 make test-image   # build, then smoke-test the image
 make dry-run      # print the docker command for this repo
 make dev          # symlink ~/.claude-sandbox to this clone, then build
 ```
 
-`claude-sandbox` is safe to `source` — `main` only runs when executed — which is how the unit tests exercise its internals.
+Every tool runs from a pinned container when it isn't installed locally, so Docker is the only requirement. `claude-sandbox` is safe to `source` — `main` runs only when the file is executed — which is how the unit tests reach its internals.
 
 ## Releases
 
-Commits follow [Conventional Commits](https://www.conventionalcommits.org/). [release-please](https://github.com/googleapis/release-please) opens a release PR that maintains `CHANGELOG.md` and the version in `claude-sandbox`; merging it tags the release, publishes a verified tarball, and pushes a multi-arch image to `ghcr.io/rsh3khar/claude-sandbox` with build provenance.
+Commits follow [Conventional Commits](https://www.conventionalcommits.org/). `make release VERSION=x.y.z` bumps the version, regenerates `CHANGELOG.md` and tags, publishing nothing. Pushing the tag publishes a verified tarball, a GitHub release, and a multi-arch image to `ghcr.io/rsh3khar/claude-sandbox` with build provenance.
 
 ## Troubleshooting
 
-**AWS credentials expired** — refresh on the host with `aws sso login`; `~/.aws` is bind-mounted, so the container picks it up immediately.
+**AWS credentials expired** — `aws sso login` on the host; `~/.aws` is bind-mounted.
 
-**Claude asks for login** — regenerate with `claude setup-token`, then `echo 'TOKEN' > ~/.claude-sandbox-token && chmod 600 ~/.claude-sandbox-token`.
+**Claude asks for login** — `claude setup-token`, then `echo 'TOKEN' > ~/.claude-sandbox-token && chmod 600 ~/.claude-sandbox-token`.
 
-**Port not reachable** — bind to `0.0.0.0`, not `127.0.0.1`. On Docker Desktop, host networking must be enabled in settings; otherwise use `--network bridge -p 3000:3000`. `cs doctor` will tell you which runtime you're on.
+**Port not reachable** — bind to `0.0.0.0`, not `127.0.0.1`. Docker Desktop needs host networking enabled in settings; otherwise `--network bridge -p 3000:3000`. `cs doctor` reports which runtime you're on.
 
 **A sandbox outlived its terminal** — `cs orphans`, then `cs kill <name>`.
 
 ## Screenshots
 
-Clipboard doesn't cross the container boundary. Point macOS screenshots at a shared folder (the installer offers to do this):
+The clipboard doesn't cross the container boundary. Point macOS screenshots at a shared folder — the installer offers this:
 
 ```bash
 mkdir -p ~/.claude/screenshots
