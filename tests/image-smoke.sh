@@ -182,6 +182,44 @@ check "session facts: browser absence is stated" "No browser"       "$(facts -e 
 check "session facts: worktree mode is stated"  "Worktree mode"     "$(facts -e SANDBOX_WORKTREE=1)"
 rm -rf "$ctxdir"
 
+# ── Injected context includes only the sections that apply ──────────────────
+ctx2="$(mktemp -d)"; mkdir -p "$ctx2/repo" "$ctx2/api"
+injected() {
+    docker run --rm -e LOCAL_MODE=1 -e DISABLE_AUTO_GIT=1 "$@" \
+        -v "$ctx2/repo:/home/node/workspace/repo" \
+        --entrypoint bash "$IMAGE" -c '
+            REPO_NAME=repo LOCAL_MODE=1 DISABLE_AUTO_GIT=1
+            eval "$(sed -n "/^write_session_facts()/,/^}/p" /entrypoint.sh)"
+            eval "$(sed -n "/^CTX_DIR=/,/^fi$/p" /entrypoint.sh)"
+            cat ~/workspace/CLAUDE.md' 2>/dev/null
+}
+
+plain=$(injected)
+withbrowser=$(injected -e ENABLE_BROWSER=1)
+withworktree=$(injected -e SANDBOX_WORKTREE=1)
+
+case "$plain" in
+    *"## Browser / UI Testing"*) bad "browser docs injected with no browser" ;;
+    *)                           ok "browser docs omitted when there is no browser" ;;
+esac
+case "$withbrowser" in
+    *"## Browser / UI Testing"*) ok "browser docs included when the browser is on" ;;
+    *)                           bad "browser docs missing when the browser is on" ;;
+esac
+case "$withworktree" in
+    *"Worktree Mode"*) ok "worktree docs included in worktree mode" ;;
+    *)                 bad "worktree docs missing in worktree mode" ;;
+esac
+case "$plain" in
+    *"Worktree Mode"*) bad "worktree docs injected outside worktree mode" ;;
+    *)                 ok "worktree docs omitted outside worktree mode" ;;
+esac
+case "$plain" in
+    *"## Parallel Agents with tmux"*) bad "tmux orchestration injected for a single-repo session" ;;
+    *)                               ok "tmux docs omitted for a single-repo session" ;;
+esac
+rm -rf "$ctx2"
+
 # ── A repo's own CLAUDE.md must survive untouched ───────────────────────────
 # An early version wrote into the repo and polluted user projects.
 ownmd="$(mktemp -d)"; mkdir -p "$ownmd/repo"
@@ -205,7 +243,7 @@ fi
 rm -rf "$ownmd"
 
 check "sandbox context explains project-level files" "does not get overwritten" \
-    "$(in_image 'cat /usr/local/share/sandbox-context.md')"
+    "$(in_image 'cat /usr/local/share/sandbox-context/core.md')"
 
 # ── Exiting must not silently kill shells attached from other terminals ─────
 check "entrypoint does not exec away its cleanup" "0" \
@@ -229,7 +267,7 @@ check "entrypoint is executable"  "OK" "$(in_image 'test -x /entrypoint.sh && ec
 check "entrypoint parses"         "OK" "$(in_image 'bash -n /entrypoint.sh && echo OK')"
 check "auto-git installed"        "OK" "$(in_image 'test -x /usr/local/bin/auto-git && echo OK')"
 check "auto-git parses"           "OK" "$(in_image 'bash -n /usr/local/bin/auto-git && echo OK')"
-check "sandbox context present"   "OK" "$(in_image 'test -f /usr/local/share/sandbox-context.md && echo OK')"
+check "sandbox context present"   "OK" "$(in_image 'test -d /usr/local/share/sandbox-context && test -f /usr/local/share/sandbox-context/core.md && echo OK')"
 check "zsh is the shell"          "/bin/zsh" "$(in_image 'echo $SHELL')"
 check "sandbox aliases loaded"    "dangerously" "$(in_image 'grep -h dangerously ~/.zshrc.sandbox | head -1')"
 

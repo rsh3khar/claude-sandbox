@@ -144,7 +144,7 @@ RUN mkdir -p "$PLAYWRIGHT_BROWSERS_PATH" && chown node:node "$PLAYWRIGHT_BROWSER
 
 COPY runtime/auto-git.sh /usr/local/bin/auto-git
 COPY runtime/entrypoint.sh /entrypoint.sh
-COPY runtime/sandbox-context.md /usr/local/share/sandbox-context.md
+COPY runtime/context/ /usr/local/share/sandbox-context/
 RUN chmod +x /usr/local/bin/auto-git /entrypoint.sh
 
 ENV CLAUDE_SANDBOX_IMAGE_VERSION="${VERSION}"

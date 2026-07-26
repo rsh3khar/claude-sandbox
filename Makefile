@@ -9,7 +9,7 @@ SHELL := /bin/bash
 
 IMAGE       ?= claude-sandbox
 REGISTRY    ?= ghcr.io/rsh3khar/claude-sandbox
-VERSION     := $(shell sed -n 's/^VERSION="\(.*\)".*/\1/p' claude-sandbox | head -1)
+CURRENT     := $(shell sed -n 's/^VERSION="\(.*\)".*/\1/p' claude-sandbox | head -1)
 VCS_REF     := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 SHELL_FILES := claude-sandbox install.sh runtime/entrypoint.sh runtime/auto-git.sh tests/image-smoke.sh tests/portability.sh
 
@@ -23,7 +23,7 @@ BATS        := $(shell command -v bats 2>/dev/null)
 .PHONY: help
 help:
 	@echo ""
-	@echo "  Claude Sandbox $(VERSION)"
+	@echo "  Claude Sandbox $(CURRENT)"
 	@echo ""
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/## /  /' | awk -F': ' '{printf "  \033[33m%-16s\033[0m %s\n", $$1, $$2}'
 	@echo ""
@@ -100,19 +100,19 @@ check: lint test portability
 ## build: Build the sandbox image locally
 .PHONY: build
 build:
-	@echo "==> docker build $(IMAGE):$(VERSION)"
+	@echo "==> docker build $(IMAGE):$(CURRENT)"
 	@DOCKER_BUILDKIT=1 docker build \
-		--build-arg VERSION=$(VERSION) \
+		--build-arg VERSION=$(CURRENT) \
 		--build-arg VCS_REF=$(VCS_REF) \
-		-t $(IMAGE) -t $(IMAGE):$(VERSION) .
+		-t $(IMAGE) -t $(IMAGE):$(CURRENT) .
 
 ## rebuild: Build with --no-cache (picks up latest agent CLIs)
 .PHONY: rebuild
 rebuild:
 	@DOCKER_BUILDKIT=1 docker build --no-cache \
-		--build-arg VERSION=$(VERSION) \
+		--build-arg VERSION=$(CURRENT) \
 		--build-arg VCS_REF=$(VCS_REF) \
-		-t $(IMAGE) -t $(IMAGE):$(VERSION) .
+		-t $(IMAGE) -t $(IMAGE):$(CURRENT) .
 
 ## dev: Symlink ~/.claude-sandbox to this repo, then build
 .PHONY: dev
@@ -133,13 +133,40 @@ dry-run:
 ## release-dry: Show what the next release would contain
 .PHONY: release-dry
 release-dry:
-	@echo "Current version: $(VERSION)"
+	@echo "Current version: $(CURRENT)"
 	@echo ""
 	@echo "Commits since last tag:"
 	@git log $$(git describe --tags --abbrev=0 2>/dev/null)..HEAD --oneline 2>/dev/null || git log --oneline
 
+## release: Cut a release — make release VERSION=0.4.0
+.PHONY: release
+release:
+	@test -n "$(VERSION)" || { echo "usage: make release VERSION=0.4.0"; exit 1; }
+	@echo "$(VERSION)" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$$' \
+		|| { echo "VERSION must be x.y.z (no leading v)"; exit 1; }
+	@test -z "$$(git status --porcelain)" \
+		|| { echo "working tree is dirty — commit first"; exit 1; }
+	@test "$$(git rev-parse --abbrev-ref HEAD)" = "main" \
+		|| { echo "not on main"; exit 1; }
+	@git rev-parse "v$(VERSION)" >/dev/null 2>&1 \
+		&& { echo "tag v$(VERSION) already exists"; exit 1; } || true
+	@$(MAKE) --no-print-directory check
+	@echo "==> version -> $(VERSION)"
+	@sed -i.bak 's/^VERSION="[^"]*"/VERSION="$(VERSION)"/' claude-sandbox && rm -f claude-sandbox.bak
+	@grep -q 'VERSION="$(VERSION)"' claude-sandbox || { echo "version bump failed"; exit 1; }
+	@echo "==> CHANGELOG"
+	@prev=$$(git describe --tags --abbrev=0 2>/dev/null || echo ""); 	 range=$${prev:+$$prev..}HEAD; 	 { 	   echo "# Changelog"; echo ""; 	   echo "All notable changes to this project are documented here."; echo ""; 	   echo "## [$(VERSION)] - $$(date +%Y-%m-%d)"; echo ""; 	   for t in feat fix perf refactor docs; do 	     case $$t in 	       feat) title="Features" ;; fix) title="Bug Fixes" ;; perf) title="Performance" ;; 	       refactor) title="Refactoring" ;; *) title="Documentation" ;; 	     esac; 	     body=$$(git log $$range --pretty=format:'%s' | sed -n "s/^$$t: /- /p"); 	     if [ -n "$$body" ]; then echo "### $$title"; echo ""; echo "$$body"; echo ""; fi; 	   done; 	   tail -n +4 CHANGELOG.md; 	 } > CHANGELOG.new && mv CHANGELOG.new CHANGELOG.md
+	@git add claude-sandbox CHANGELOG.md
+	@git commit -q -m "chore: release v$(VERSION)"
+	@git tag -a "v$(VERSION)" -m "v$(VERSION)"
+	@echo ""
+	@echo "  Tagged v$(VERSION). Nothing is published yet."
+	@echo "  Push to trigger the release workflow:"
+	@echo "    git push origin main --follow-tags"
+	@echo ""
+
 ## clean: Remove local images and build cache
 .PHONY: clean
 clean:
-	@docker image rm -f $(IMAGE) $(IMAGE):$(VERSION) 2>/dev/null || true
+	@docker image rm -f $(IMAGE) $(IMAGE):$(CURRENT) 2>/dev/null || true
 	@docker builder prune -f --filter until=24h

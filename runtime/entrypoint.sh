@@ -237,10 +237,27 @@ write_session_facts() {
     } > "$out"
 }
 
-SANDBOX_CTX="/usr/local/share/sandbox-context.md"
-if [[ -f "$SANDBOX_CTX" ]]; then
+# Only the sections that apply. The full document is ~220 lines and most of it
+# is conditional — Playwright docs with no browser, tmux orchestration nobody
+# asked for — and it is read on every single launch.
+CTX_DIR="/usr/local/share/sandbox-context"
+if [[ -d "$CTX_DIR" ]]; then
     write_session_facts ~/workspace/CLAUDE.md
-    cat "$SANDBOX_CTX" >> ~/workspace/CLAUDE.md
+    cat "$CTX_DIR/core.md" >> ~/workspace/CLAUDE.md
+
+    [[ -n "${SANDBOX_WORKTREE:-}" ]] && cat "$CTX_DIR/worktree.md" >> ~/workspace/CLAUDE.md
+    [[ -n "${ENABLE_BROWSER:-}" ]] && cat "$CTX_DIR/browser.md" >> ~/workspace/CLAUDE.md
+
+    # tmux orchestration only matters once there is more than one repo to split
+    # work across, or the user asked for a browser-driven workflow.
+    if [[ $(find "$HOME/workspace" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) -gt 1 ]]; then
+        cat "$CTX_DIR/tmux.md" >> ~/workspace/CLAUDE.md
+    fi
+
+    if [[ -d "$HOME/.claude/skills" ]] || [[ -d "$HOME/.agents/skills" ]]; then
+        cat "$CTX_DIR/skills.md" >> ~/workspace/CLAUDE.md
+    fi
+
     cp ~/workspace/CLAUDE.md ~/workspace/AGENTS.md
 fi
 
