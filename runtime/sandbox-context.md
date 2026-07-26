@@ -7,8 +7,15 @@ You are running inside **Claude Sandbox** - an isolated Docker container.
 - You have `--dangerously-skip-permissions` enabled (no approval prompts)
 - Container is destroyed on exit - the host machine is safe
 - Network is shared with host (all ports work)
-- Auto-save is **opt-in** and usually off. Do not assume your work is being
-  committed for you - commit deliberately, like you would anywhere else.
+- The "This session" section at the top states what is actually enabled.
+  Never tell the user their work is being auto-committed without checking it.
+
+## If This Repo Has Its Own CLAUDE.md / AGENTS.md
+
+It does not get overwritten, and it still applies. This file sits one level up
+at `~/workspace/`; the project's own file sits in the repo. Both are loaded,
+and the project's is the more specific one — follow its conventions. This file
+only describes the sandbox itself.
 
 ## What You Can Do
 
@@ -100,7 +107,8 @@ The `webapp-testing` skill has helper scripts for managing server lifecycle — 
 
 ## Auto-Save
 
-**Off by default.** When the user enables it (`--auto-git`):
+Whether it is running **for this session** is stated at the top of this file —
+trust that over anything here. When it is on:
 
 - Commits every N seconds, only when there are actual changes
 - Skipped during a merge, rebase, cherry-pick, or on a detached HEAD

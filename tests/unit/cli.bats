@@ -1196,3 +1196,45 @@ setup() {
     menu+=("Done")
     [[ "${menu[*]}" == *"Remove a mount"* ]]
 }
+
+# ── Direct invocation (cs .) ─────────────────────────────────────────────────
+
+@test "cs . keeps mounts declared in the repo's .claude-sandbox" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/main" "$base/sibling"
+    printf 'MOUNTS=../sibling\n' > "$base/main/.claude-sandbox"
+
+    LOCAL_PATH=""; SELECTED_REPO=""; EXTRA_PATHS=(); MOUNTS=""
+    DRY_RUN=true
+
+    resolve_target "$base/main" >/dev/null 2>&1
+    [ "${#EXTRA_PATHS[@]}" -eq 1 ]
+    [ "$(mount_name "${EXTRA_PATHS[0]}")" = "sibling" ]
+
+    rm -rf "$base"
+}
+
+@test "cs . accepts extra folders as arguments and via -m" {
+    POSITIONAL=()
+    parse_args . -m /tmp/one /tmp/two
+    # target plus both extras survive parsing
+    [ "${#POSITIONAL[@]}" -eq 3 ]
+    [[ "${POSITIONAL[*]}" == *"/tmp/one"* ]]
+    [[ "${POSITIONAL[*]}" == *"/tmp/two"* ]]
+}
+
+@test "the launch step offers to add folders, and cancel means cancel" {
+    LOCAL_MODE=true; LOCAL_PATH="/tmp/r"; SELECTED_REPO="r"; EXTRA_PATHS=()
+    ASSUME_YES=false
+    clear() { :; }
+    gum() { return 0; }
+
+    pick_one() { printf 'Cancel'; }
+    run screen_launch_confirm
+    [ "$status" -ne 0 ]
+
+    pick_one() { printf 'Launch sandbox'; }
+    run screen_launch_confirm
+    [ "$status" -eq 0 ]
+}

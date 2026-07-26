@@ -71,6 +71,7 @@ This installs a pinned release, verifies it against the published `SHA256SUMS`, 
 
 ```bash
 cs .                      # sandbox the current repo (from any subdirectory)
+cs . ~/work/api ~/notes   # …with extra folders, straight from the command line
 cs ~/projects/my-app      # any folder — git or not
 cs . -w                   # worktree mode: your checkout is never touched
 cs . -m ~/work/api -m ~/notes:ro    # mount siblings, some read-only

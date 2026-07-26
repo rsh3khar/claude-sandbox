@@ -16,6 +16,15 @@ set -euo pipefail
 #   SKIP_BRANCH_MENU      non-empty -> stay on the current branch
 #   GIT_USER_NAME/EMAIL   commit identity forwarded from the host
 
+# npx asks "Ok to proceed?" when a package is missing AND stdin is a terminal.
+# Inside a command substitution that prompt is invisible, so the session simply
+# appears frozen. NPM_CONFIG_YES answers it, everywhere.
+#
+# Deliberately NOT CI=1. That also stops npx prompting, but CI is the standard
+# signal for "no colour, non-interactive", and Claude Code and Codex both
+# honour it — setting it stripped the colour out of the agent TUI.
+export NPM_CONFIG_YES=true
+
 LOCAL_MODE="${LOCAL_MODE:-}"
 if [[ "${1:-}" == "--local" ]]; then
     LOCAL_MODE=1
@@ -48,18 +57,29 @@ BOLD=$'\033[1m'
 
 # Spinner for long-running tasks
 # Usage: run_with_spinner "message" command arg1 arg2 ...
+# Run a step with a spinner. Output is captured rather than discarded: a step
+# that fails prints its last lines instead of a bare warning, and the elapsed
+# time is shown so a slow step is visibly making progress rather than hung.
+LAST_STEP_LOG=""
 run_with_spinner() {
     local msg="$1"
     shift
     local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-    local i=0
+    local i=0 elapsed=0
 
-    "$@" >/dev/null 2>&1 &
+    LAST_STEP_LOG=$(mktemp)
+    "$@" > "$LAST_STEP_LOG" 2>&1 &
     local pid=$!
+    local start=$SECONDS
 
     tput civis 2>/dev/null || true
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r  %s%s%s %s%s%s  " "$C_ACCENT" "${frames[$i]}" "$NC" "$C_DIM" "$msg" "$NC"
+        elapsed=$(( SECONDS - start ))
+        if [[ "$elapsed" -ge 5 ]]; then
+            printf "\r  %s%s%s %s%s (%ss)%s  " "$C_ACCENT" "${frames[$i]}" "$NC" "$C_DIM" "$msg" "$elapsed" "$NC"
+        else
+            printf "\r  %s%s%s %s%s%s  " "$C_ACCENT" "${frames[$i]}" "$NC" "$C_DIM" "$msg" "$NC"
+        fi
         i=$(( (i + 1) % ${#frames[@]} ))
         sleep 0.08
     done
@@ -67,7 +87,12 @@ run_with_spinner() {
 
     local exit_code=0
     wait "$pid" || exit_code=$?
-    printf "\r%60s\r" ""
+    printf "\r%70s\r" ""
+
+    if [[ "$exit_code" -ne 0 ]]; then
+        echo -e "  ${C_WARN}⚠${NC} ${msg} failed ${C_DIM}(exit ${exit_code})${NC}"
+        sed 's/^/      /' "$LAST_STEP_LOG" | tail -6
+    fi
     return $exit_code
 }
 
@@ -136,8 +161,8 @@ if [[ -n "$LOCAL_MODE" ]]; then
     cd ~/workspace/"$REPO_NAME"
 else
     REPO_NAME=$(basename "$GIT_URL" .git)
-    echo -e "${C_DIM}Cloning ${REPO_NAME}...${NC}"
-    git clone --quiet "$GIT_URL" ~/workspace/"$REPO_NAME"
+    run_with_spinner "Cloning ${REPO_NAME}" git clone "$GIT_URL" "$HOME/workspace/$REPO_NAME" \
+        || { echo -e "  ${C_WARN}⚠${NC} clone failed"; exit 1; }
     cd ~/workspace/"$REPO_NAME"
 fi
 
@@ -148,10 +173,75 @@ fi
 # Sandbox context for the agents. Written to the workspace root (the parent of
 # the repo) so no repo file is ever touched — Claude Code and Codex both walk
 # parent directories looking for CLAUDE.md / AGENTS.md.
+# The static file can only describe features conditionally ("when auto-save is
+# enabled..."), which leaves the agent guessing which branch applies — and it
+# guessed wrong, telling users their work was being auto-committed when it was
+# not. So the real state of THIS session is generated and put first.
+write_session_facts() {
+    local out="$1"
+
+    {
+        echo "# This session"
+        echo ""
+        echo "These are the actual settings in force right now. Where this"
+        echo "disagrees with anything below, this section is correct."
+        echo ""
+
+        if [[ -n "${SANDBOX_WORKTREE:-}" ]]; then
+            echo "- **Worktree mode.** \`${REPO_NAME}\` is a git worktree on a scratch"
+            echo "  branch, not the user's working tree. Their checkout is untouched;"
+            echo "  commit normally and they merge the branch afterwards."
+        elif [[ -n "$LOCAL_MODE" ]]; then
+            echo "- **Local mode.** \`${REPO_NAME}\` is bind-mounted from the user's"
+            echo "  machine: edits and deletions are immediate and real. Nothing is"
+            echo "  pushed anywhere."
+        else
+            echo "- **Cloned repo.** \`${REPO_NAME}\` lives inside this container. If the"
+            echo "  container is destroyed, anything unpushed is gone."
+        fi
+
+        if [[ -n "${DISABLE_AUTO_GIT:-}" ]]; then
+            echo "- **Auto-save is OFF.** Nothing commits your work for you. Commit"
+            echo "  deliberately, and never tell the user their work is being saved"
+            echo "  automatically."
+        else
+            echo "- **Auto-save is ON**, every ${AUTO_GIT_INTERVAL:-60}s, and only when"
+            echo "  there are changes. It watches \`${REPO_NAME}\` only — changes in"
+            echo "  other mounted folders are yours to commit."
+        fi
+
+        if [[ -n "${ENABLE_BROWSER:-}" ]]; then
+            echo "- **Headless Chromium is available** via Playwright and the"
+            echo "  playwright MCP server."
+        else
+            echo "- **No browser.** Playwright is not installed; the user must"
+            echo "  relaunch with --browser to get one."
+        fi
+
+        local extras=()
+        local d name
+        while IFS= read -r d; do
+            [[ -n "$d" && "$d" != "$HOME/workspace/$REPO_NAME" ]] || continue
+            name=$(basename "$d")
+            if [[ -w "$d" ]]; then extras+=("$name"); else extras+=("$name (read-only)"); fi
+        done < <(find "$HOME/workspace" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+
+        if [[ ${#extras[@]} -gt 0 ]]; then
+            echo "- **Also mounted:** $(printf '%s, ' "${extras[@]}" | sed 's/, $//')."
+            echo "  Read-only ones cannot be modified — do not try."
+        fi
+
+        echo ""
+        echo "---"
+        echo ""
+    } > "$out"
+}
+
 SANDBOX_CTX="/usr/local/share/sandbox-context.md"
 if [[ -f "$SANDBOX_CTX" ]]; then
-    cp "$SANDBOX_CTX" ~/workspace/CLAUDE.md
-    cp "$SANDBOX_CTX" ~/workspace/AGENTS.md
+    write_session_facts ~/workspace/CLAUDE.md
+    cat "$SANDBOX_CTX" >> ~/workspace/CLAUDE.md
+    cp ~/workspace/CLAUDE.md ~/workspace/AGENTS.md
 fi
 
 # ── Browser (opt-in) ─────────────────────────────────────────────────────────
@@ -220,7 +310,7 @@ if [[ -n "${UPDATE_TOOLS:-}" ]]; then
     echo -e "${C_DIM}Checking for updates...${NC}"
 
     CLAUDE_CURRENT=$(claude --version 2>/dev/null || echo "")
-    if run_with_spinner "Updating Claude Code" bash -c "curl -fsSL https://claude.ai/install.sh | bash -s latest"; then
+    if run_with_spinner "Updating Claude Code" timeout 300 bash -c "curl -fsSL https://claude.ai/install.sh | bash -s latest"; then
         CLAUDE_NEW=$(claude --version 2>/dev/null || echo "")
         if [[ -n "$CLAUDE_CURRENT" && "$CLAUDE_CURRENT" == "$CLAUDE_NEW" ]]; then
             echo -e "  ${C_SUCCESS}✓${NC} Claude Code ${C_DIM}(${CLAUDE_NEW:-unknown}, latest)${NC}"
@@ -233,7 +323,7 @@ if [[ -n "${UPDATE_TOOLS:-}" ]]; then
 
     # Same CODEX_HOME pinning as the image build — see Dockerfile.
     CODEX_CURRENT=$(codex --version 2>/dev/null || echo "")
-    if run_with_spinner "Updating Codex" sudo env \
+    if run_with_spinner "Updating Codex" timeout 300 sudo env \
         CODEX_HOME=/opt/codex \
         CODEX_INSTALL_DIR=/usr/local/bin \
         CODEX_NON_INTERACTIVE=true \
@@ -250,8 +340,9 @@ if [[ -n "${UPDATE_TOOLS:-}" ]]; then
     fi
 
     if [[ -n "${ENABLE_BROWSER:-}" ]]; then
-        PW_CURRENT=$(npx playwright --version 2>/dev/null || echo "")
-        PW_LATEST=$(npm view playwright@latest version 2>/dev/null || echo "")
+        echo -e "  ${C_DIM}checking Playwright version...${NC}"
+        PW_CURRENT=$(timeout 60 npx -y playwright --version 2>/dev/null || echo "")
+        PW_LATEST=$(timeout 30 npm view playwright@latest version 2>/dev/null || echo "")
         if [[ -n "$PW_CURRENT" && -n "$PW_LATEST" && "$PW_CURRENT" == *"$PW_LATEST"* ]]; then
             echo -e "  ${C_SUCCESS}✓${NC} Playwright ${C_DIM}(${PW_CURRENT}, latest)${NC}"
         else
@@ -287,13 +378,14 @@ checkout_or_create() {
     if git show-ref --verify --quiet "refs/heads/$branch"; then
         git checkout "$branch" --quiet
         echo -e "${C_SUCCESS}✓${NC} Switched to ${C_ACCENT}${branch}${NC}"
-    elif [[ -z "$LOCAL_MODE" ]] && git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+    elif [[ -z "$LOCAL_MODE" ]] && timeout 30 git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
         git checkout -b "$branch" --track "origin/$branch" --quiet
         echo -e "${C_SUCCESS}✓${NC} Tracking ${C_ACCENT}${branch}${NC}"
     else
         git checkout -b "$branch" --quiet
         if [[ -z "$LOCAL_MODE" ]]; then
-            git push -u origin "$branch" --quiet 2>/dev/null || true
+            run_with_spinner "Pushing ${branch}" timeout 60 git push -u origin "$branch" \
+                || echo -e "  ${C_DIM}(not pushed — you can push later)${NC}"
         fi
         echo -e "${C_SUCCESS}✓${NC} Created ${C_ACCENT}${branch}${NC}"
     fi
@@ -377,13 +469,18 @@ show_branch_menu() {
                     done
                 else
                     echo "$SANDBOX_BRANCHES" | while read -r b; do
-                        [[ -n "$b" ]] && git push origin --delete "$b" 2>/dev/null && echo -e "  ${C_SUCCESS}✓${NC} Deleted $b"
+                        [[ -n "$b" ]] || continue
+                        if timeout 60 git push origin --delete "$b" >/dev/null 2>&1; then
+                            echo -e "  ${C_SUCCESS}✓${NC} Deleted $b"
+                        else
+                            echo -e "  ${C_WARN}⚠${NC} Could not delete $b"
+                        fi
                     done
                 fi
             fi
         fi
         if [[ -z "$LOCAL_MODE" ]]; then
-            git fetch --prune --quiet 2>/dev/null || true
+            run_with_spinner "Refreshing branches" timeout 60 git fetch --prune || true
         fi
         show_branch_menu
         return
@@ -443,7 +540,8 @@ show_branch_menu() {
             echo ""
             git checkout -b "$BRANCH_NAME" --quiet
             if [[ -z "$LOCAL_MODE" ]]; then
-                git push -u origin "$BRANCH_NAME" --quiet 2>/dev/null || true
+                run_with_spinner "Pushing ${BRANCH_NAME}" timeout 60 git push -u origin "$BRANCH_NAME" \
+                    || echo -e "  ${C_DIM}(not pushed — you can push later)${NC}"
             fi
             echo -e "${C_SUCCESS}✓${NC} Created ${C_ACCENT}${BRANCH_NAME}${NC} ${C_DIM}from ${BASE_BRANCH}${NC}"
         fi
@@ -487,7 +585,10 @@ cleanup() {
         git add -A
         git commit -m "wip: session end" --no-verify 2>/dev/null || true
         if [[ -z "$LOCAL_MODE" ]]; then
-            git push 2>/dev/null || true
+            echo -e "${C_DIM}Pushing...${NC}"
+            timeout 60 git push >/dev/null 2>&1 \
+                && echo -e "${C_DIM}Pushed.${NC}" \
+                || echo -e "${C_WARN}⚠${NC} Push failed — your commits are still local"
         fi
     fi
     echo -e "${C_DIM}Goodbye!${NC}"
@@ -599,9 +700,9 @@ else
         read -r -p "  Install popular skills now? [y/N]: " INSTALL_SKILLS
         if [[ "$INSTALL_SKILLS" == "y" || "$INSTALL_SKILLS" == "Y" ]]; then
             echo ""
-            npx -y skills add anthropics/claude-code-skills 2>/dev/null \
-                && echo -e "  ${C_SUCCESS}✓${NC} Claude skills installed" \
-                || echo -e "  ${C_ACCENT}⚠${NC} Claude skills install failed"
+            if run_with_spinner "Installing skills" npx -y skills add anthropics/claude-code-skills; then
+                echo -e "  ${C_SUCCESS}✓${NC} Claude skills installed"
+            fi
         fi
     fi
 fi
@@ -610,4 +711,32 @@ echo ""
 echo -e "${C_DIM}─────────────────────────────────────────${NC}"
 echo ""
 
-exec zsh
+# Deliberately NOT `exec zsh`.
+#
+# exec replaces this process, which silently discarded the EXIT trap below —
+# so the session-end commit never actually ran. Keeping bash as PID 1 means
+# cleanup happens, and it gives us somewhere to notice that other shells are
+# still attached before the container (and their work) disappears.
+count_attached_shells() {
+    # Shells from `cs attach` are separate zsh processes in this container.
+    pgrep -x zsh 2>/dev/null | grep -c . || echo 0
+}
+
+while true; do
+    zsh || true
+
+    attached=$(count_attached_shells)
+    [[ "$attached" -gt 0 ]] || break
+
+    echo ""
+    echo -e "  ${C_WARN}⚠${NC}  ${attached} other shell(s) still attached to this sandbox."
+    echo -e "     ${C_DIM}Leaving destroys the container and kills them.${NC}"
+    echo ""
+    read -r -p "  Exit anyway? [y/N] " leave_anyway
+    case "$leave_anyway" in
+        [Yy]*) break ;;
+        *) echo -e "  ${C_DIM}Staying. Type exit again when you are done.${NC}" ;;
+    esac
+done
+
+cleanup

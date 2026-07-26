@@ -167,6 +167,63 @@ fi
 git -C "$wtdir/main" worktree remove --force "$wtdir/tree" >/dev/null 2>&1 || true
 rm -rf "$wtdir"
 
+# ── Injected context must describe THIS session, not features in general ────
+ctxdir="$(mktemp -d)"; mkdir -p "$ctxdir/repo"
+facts() {
+    docker run --rm -e "LOCAL_MODE=1" "$@" -v "$ctxdir/repo:/home/node/workspace/repo" \
+        --entrypoint bash "$IMAGE" -c '
+            REPO_NAME=repo
+            source <(sed -n "/^write_session_facts()/,/^}/p" /entrypoint.sh)
+            write_session_facts /tmp/f && cat /tmp/f' 2>/dev/null
+}
+check "session facts: auto-save off is stated"  "Auto-save is OFF" "$(facts -e DISABLE_AUTO_GIT=1)"
+check "session facts: auto-save on states interval" "every 120s"    "$(facts -e AUTO_GIT_INTERVAL=120)"
+check "session facts: browser absence is stated" "No browser"       "$(facts -e DISABLE_AUTO_GIT=1)"
+check "session facts: worktree mode is stated"  "Worktree mode"     "$(facts -e SANDBOX_WORKTREE=1)"
+rm -rf "$ctxdir"
+
+# ── A repo's own CLAUDE.md must survive untouched ───────────────────────────
+# An early version wrote into the repo and polluted user projects.
+ownmd="$(mktemp -d)"; mkdir -p "$ownmd/repo"
+printf '# project rules\n' > "$ownmd/repo/CLAUDE.md"
+before_md5=$(md5 -q "$ownmd/repo/CLAUDE.md" 2>/dev/null || md5sum "$ownmd/repo/CLAUDE.md" | cut -d" " -f1)
+
+docker run --rm -e "LOCAL_MODE=1" -e "DISABLE_AUTO_GIT=1" \
+    -v "$ownmd/repo:/home/node/workspace/repo" --entrypoint bash "$IMAGE" -c '
+        REPO_NAME=repo LOCAL_MODE=1 DISABLE_AUTO_GIT=1
+        source <(sed -n "/^write_session_facts()/,/^}/p" /entrypoint.sh)
+        write_session_facts ~/workspace/CLAUDE.md
+        cat /usr/local/share/sandbox-context.md >> ~/workspace/CLAUDE.md
+        test -f ~/workspace/repo/CLAUDE.md' >/dev/null 2>&1
+
+after_md5=$(md5 -q "$ownmd/repo/CLAUDE.md" 2>/dev/null || md5sum "$ownmd/repo/CLAUDE.md" | cut -d" " -f1)
+if [[ "$before_md5" == "$after_md5" ]]; then
+    ok "a repo's own CLAUDE.md is left byte-identical"
+else
+    bad "a repo's own CLAUDE.md was modified"
+fi
+rm -rf "$ownmd"
+
+check "sandbox context explains project-level files" "does not get overwritten" \
+    "$(in_image 'cat /usr/local/share/sandbox-context.md')"
+
+# ── Exiting must not silently kill shells attached from other terminals ─────
+check "entrypoint does not exec away its cleanup" "0" \
+    "$(in_image 'grep -c "^exec zsh" /entrypoint.sh || echo 0')"
+check "attached shells are counted before exit" "OK" \
+    "$(in_image 'grep -q "count_attached_shells" /entrypoint.sh && echo OK')"
+
+acid=$(docker run -d --entrypoint bash "$IMAGE" -c 'sleep 60')
+docker exec -d "$acid" zsh -c 'while :; do sleep 1; done'
+sleep 1
+attached=$(docker exec "$acid" bash -c 'pgrep -x zsh 2>/dev/null | grep -c . || echo 0')
+if [[ "$attached" -ge 1 ]]; then
+    ok "a shell attached from another terminal is detectable"
+else
+    bad "attached shells are invisible, so exit would destroy them silently"
+fi
+docker rm -f "$acid" >/dev/null 2>&1
+
 # ── Entrypoint sanity ────────────────────────────────────────────────────────
 check "entrypoint is executable"  "OK" "$(in_image 'test -x /entrypoint.sh && echo OK')"
 check "entrypoint parses"         "OK" "$(in_image 'bash -n /entrypoint.sh && echo OK')"
@@ -176,7 +233,32 @@ check "sandbox context present"   "OK" "$(in_image 'test -f /usr/local/share/san
 check "zsh is the shell"          "/bin/zsh" "$(in_image 'echo $SHELL')"
 check "sandbox aliases loaded"    "dangerously" "$(in_image 'grep -h dangerously ~/.zshrc.sandbox | head -1')"
 
+# ── Nothing may block on a hidden prompt ─────────────────────────────────────
+# `npx` asks "Ok to proceed?" when a package is missing and stdin is a TTY.
+# Inside a command substitution that prompt is invisible and the session just
+# appears frozen — which is exactly what happened during a tool update.
+check "npx is non-interactive" "true"   "$(in_image 'grep -m1 -o "NPM_CONFIG_YES=true" /entrypoint.sh | cut -d= -f2')"
+check "no bare npx is executed" "0" \
+    "$(in_image 'grep -vE "^\s*#|echo" /entrypoint.sh | grep -cE "(^|[^-])npx [^-]" || echo 0')"
+
+# Every network call that could stall is bounded, so a hang ends in an error
+# rather than an unexplained freeze.
+# CI=1 also silences npx, but it is the standard "no colour, non-interactive"
+# signal — setting it stripped every colour out of the agent TUI.
+check "entrypoint does not set CI" "0" \
+    "$(in_image 'grep -c "^export CI=" /entrypoint.sh || echo 0')"
+check "no colour-suppressing vars set" "OK" \
+    "$(in_image 'grep -qE "^export (NO_COLOR|TERM=dumb|CLICOLOR=0)" /entrypoint.sh && echo BAD || echo OK')"
+
+check "network calls are bounded" "OK" \
+    "$(in_image 'grep -q "timeout 300 bash -c" /entrypoint.sh && grep -q "timeout 60 git push" /entrypoint.sh && echo OK')"
+
+# A failing step must print why, not just a warning symbol.
+check "failed steps print their output" "OK" \
+    "$(in_image 'grep -q "sed .s/\^/      /. \"\$LAST_STEP_LOG\"" /entrypoint.sh && echo OK')"
+
 echo ""
 echo "  ${PASS} passed, ${FAIL} failed"
 echo ""
 [[ "$FAIL" -eq 0 ]]
+
