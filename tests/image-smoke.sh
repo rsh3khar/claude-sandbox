@@ -136,18 +136,26 @@ fi
 rm -rf "$execdir"
 
 # ── Worktree mode: git must be fully functional inside the container ─────────
-wtdir="$(cd "$(mktemp -d)" && pwd -P)"   # resolve symlinked /var on macOS
-(
-    cd "$wtdir"
-    mkdir main
-    cd main
-    git init -q
-    echo hi > a.txt
-    git add -A
-    git -c user.email=t@t -c user.name=t commit -qm init
-    git worktree add -q "$wtdir/tree" -b agent-work
-) >/dev/null 2>&1
+wtdir="$(cd "$(mktemp -d)" && pwd -P)"
 
+# Setup failures used to be swallowed by `>/dev/null 2>&1`, so a git error on a
+# CI runner surfaced only as "exit code 128" with no clue which command.
+if ! wt_setup=$(
+        cd "$wtdir" &&
+        mkdir main &&
+        cd main &&
+        git init -q &&
+        echo hi > a.txt &&
+        git add -A &&
+        git -c user.email=t@t -c user.name=t commit -qm init &&
+        git worktree add -q "$wtdir/tree" -b agent-work
+    2>&1); then
+    bad "worktree test setup failed: $(printf '%s' "$wt_setup" | tr '\n' ' ' | head -c 200)"
+    rm -rf "$wtdir"
+    wtdir=""
+fi
+
+if [[ -n "$wtdir" ]]; then
 wt_out=$(docker run --rm \
     -v "$wtdir/tree:/home/node/workspace/proj" \
     -v "$wtdir/main/.git:$wtdir/main/.git" \
@@ -173,6 +181,7 @@ else
 fi
 git -C "$wtdir/main" worktree remove --force "$wtdir/tree" >/dev/null 2>&1 || true
 rm -rf "$wtdir"
+fi
 
 # ── Injected context must describe THIS session, not features in general ────
 ctxdir="$(mktemp -d)"; mkdir -p "$ctxdir/repo"
