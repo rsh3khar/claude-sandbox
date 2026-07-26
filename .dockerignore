@@ -7,9 +7,6 @@ tests
 completions
 *.png
 *.md
-!runtime/sandbox-context.md
 Makefile
 install.sh
 claude-sandbox
-.release-please-manifest.json
-release-please-config.json

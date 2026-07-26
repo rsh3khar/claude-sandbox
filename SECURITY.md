@@ -1,6 +1,6 @@
 # Security Model
 
-Claude Sandbox runs coding agents with all approval prompts disabled. That is the point, and it means the security model deserves a precise description rather than a reassuring one.
+Claude Sandbox runs coding agents with all approval prompts disabled.
 
 ## Threat model
 
@@ -25,7 +25,7 @@ If you need containment against a hostile agent, this is the wrong tool. Use a d
 ## What is deliberately not exposed
 
 - **Your working tree, under `--worktree`.** The agent gets a git worktree on a scratch branch; your checkout is never mounted.
-- **Host file permissions.** Earlier versions ran `chmod -R 777` across the workspace, which in local mode propagated to the real repository on the host. That is fixed; only container-local paths are touched.
+- **Host file permissions.** The entrypoint touches only container-local paths, never bind-mounted ones. An image smoke test asserts it.
 - **Code execution from config files.** `.claude-sandbox` files are parsed with a key allowlist and a value pattern, never sourced, so opening an untrusted repo with `cs .` cannot run code on your host.
 
 ## Reducing exposure

@@ -274,8 +274,8 @@ if [[ "$SKIP_DEPS" == "false" ]]; then
         fi
     fi
 
-    # Recommended, not required: enables the drill-down folder browser with a
-    # preview pane. Everything works without it, just with a plainer picker.
+    # Recommended, not required: makes the folder picker a filterable
+    # multi-select list with a preview pane instead of a plain single column.
     if check_cmd fzf; then
         say_ok "fzf ${C_DIM}(folder browser)${NC}"
     else

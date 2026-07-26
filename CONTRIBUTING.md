@@ -13,8 +13,9 @@ In dev mode, edits to `claude-sandbox` take effect immediately. Changes under `r
 ## The loop
 
 ```bash
-make check        # lint + format check + unit tests — run before pushing
+make check        # lint + unit tests + portability — run before pushing
 make test         # bats unit tests only (fast, no Docker daemon needed)
+make portability  # pure functions under the system bash (3.2 on macOS)
 make test-image   # build the image and smoke-test it
 make dry-run      # see the exact docker command this repo would launch with
 ```
@@ -36,8 +37,9 @@ When you fix a bug, add the test that would have caught it.
 
 ## Style
 
-- `bash` with `set -euo pipefail`, 4-space indent, `shfmt -i 4 -ci`
+- `bash` with `set -euo pipefail`, 4-space indent
 - shellcheck clean at `--severity=warning`; use a targeted `# shellcheck disable=` with a reason when you must
+- `make fmt` runs `shfmt -i 4 -ci` if you want it, but formatting is not gated: this codebase aligns case arms and box-drawing calls into columns deliberately, and shfmt collapses that
 - comments explain *why*, particularly where behaviour looks odd — most of the odd-looking code here is working around a real platform difference
 
 ## Commits
@@ -51,10 +53,15 @@ perf: render the contribution graph in one jq pass
 docs: describe the threat model honestly
 ```
 
-`feat` bumps the minor version, `fix` the patch. `!` or a `BREAKING CHANGE:` footer bumps major.
-
-Do not edit `CHANGELOG.md` or the `VERSION` line in `claude-sandbox` by hand — release-please owns both.
+`feat`, `fix`, `perf`, `refactor` and `docs` become changelog sections. Other types (`test`, `build`, `chore`) stay out of it.
 
 ## Releasing
 
-Merging to `main` updates a release PR. Merging *that* tags the release, publishes a tarball with `SHA256SUMS`, and pushes a multi-arch image to GHCR with build provenance. No manual tagging.
+```bash
+make release VERSION=0.4.0        # runs check, bumps VERSION, regenerates CHANGELOG.md, tags
+git push origin main --follow-tags
+```
+
+`make release` publishes nothing; the tag does. Pushing it builds a tarball with `SHA256SUMS`, creates the GitHub release, and pushes a multi-arch image to GHCR with build provenance. The version is chosen by hand — nothing infers it from commit types.
+
+`CHANGELOG.md` and the `VERSION` line in `claude-sandbox` are both rewritten by `make release`, so edits to them by hand will be overwritten.

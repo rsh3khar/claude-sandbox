@@ -8,7 +8,7 @@ set -euo pipefail
 #  ╚═══════════════════════════════════════════════════════════════════════╝
 ###############################################################################
 
-VERSION="0.4.0" # x-release-please-version
+VERSION="0.4.0"
 readonly VERSION
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
@@ -1421,31 +1421,6 @@ offer_repo_mounts() {
     done <<< "$picked"
 }
 
-# Directory browser with a preview pane and drill-down, in the spirit of
-# Finder's column view: the list is the current level, the right pane shows
-# what is inside the highlighted folder, → descends and ← goes back up.
-#
-# Multi-select is the point — mounting four repos should be four taps of tab,
-# not four trips through a wizard. Prints one absolute path per line.
-# Each row is "<absolute path>\tab<display>". Keeping the path in its own
-# hidden column is the whole trick: fzf's {1} is then always a clean path, and
-# the display half is free to carry markers and styling. Deriving the path back
-# out of a decorated string does not work — the [repo] marker is wrapped in
-# escape codes, so stripping it by pattern silently yields an invalid path.
-readonly BROWSE_LIST_BODY='
-    for p in "$dir"/*/; do
-        [ -d "$p" ] || continue
-        p=${p%/}
-        n=${p##*/}
-        case "$n" in .*) continue ;; esac
-        if [ -e "$p/.git" ]; then printf "%s\t%s  [repo]\n" "$p" "$n"
-        else printf "%s\t%s/\n" "$p" "$n"; fi
-    done'
-
-list_dirs_of() {
-    dir="$1" sh -c "$BROWSE_LIST_BODY"
-}
-
 # Flat, filterable, multi-select list of folders under an anchor.
 #
 # Deliberately NOT a drill-down browser. Navigation required fzf's `reload`,
@@ -1488,7 +1463,11 @@ type to filter   space/tab mark   enter add all marked   esc cancel' \
         | cut -f1
 }
 
-# What the picker offers, as "<path>\t<display>".
+# What the picker offers, as "<path>\t<display>". Keeping the path in its own
+# hidden column is the trick: fzf's {1} is then always a clean path, while the
+# display half is free to carry markers and styling. Deriving the path back out
+# of a decorated string does not work — the [repo] marker is wrapped in escape
+# codes, so stripping it by pattern silently yields an invalid path.
 #
 # Reach goes back as far as $HOME and no further, in one flat list — no
 # navigation keys, because navigating needs fzf's `reload` and reload clears

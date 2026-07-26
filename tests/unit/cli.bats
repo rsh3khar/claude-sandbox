@@ -675,21 +675,6 @@ setup() {
     rm -rf "$base"
 }
 
-
-@test "list_dirs_of marks git repos and skips dotfolders" {
-    local base
-    base="$(mktemp -d)"
-    mkdir -p "$base/a-repo/.git" "$base/plain" "$base/.hidden"
-
-    run list_dirs_of "$base"
-    [[ "$output" == *"a-repo"* ]]
-    [[ "$output" == *"[repo]"* ]]
-    [[ "$output" == *"plain"* ]]
-    [[ "$output" != *".hidden"* ]]
-
-    rm -rf "$base"
-}
-
 # ── Menus must never abort the CLI ───────────────────────────────────────────
 
 
