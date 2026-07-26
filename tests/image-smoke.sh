@@ -263,7 +263,7 @@ docker run --rm -e "LOCAL_MODE=1" -e "DISABLE_AUTO_GIT=1" \
         REPO_NAME=repo LOCAL_MODE=1 DISABLE_AUTO_GIT=1
         source <(sed -n "/^write_session_facts()/,/^}/p" /entrypoint.sh)
         write_session_facts ~/workspace/CLAUDE.md
-        cat /usr/local/share/sandbox-context.md >> ~/workspace/CLAUDE.md
+        cat /usr/local/share/sandbox-context/core.md >> ~/workspace/CLAUDE.md
         test -f ~/workspace/repo/CLAUDE.md' >/dev/null 2>&1
 
 after_md5=$(md5sum "$ownmd/repo/CLAUDE.md" 2>/dev/null | cut -d" " -f1 || md5 -q "$ownmd/repo/CLAUDE.md")

@@ -25,5 +25,5 @@ alias gl='git log --oneline -20'
 # Tail the auto-save daemon
 alias autogit-log='tail -f /tmp/auto-git.log'
 
-# Show sandbox banner again
-alias sandbox-info='cat /usr/local/share/sandbox-context.md'
+# Re-read the context the agent was given (assembled at startup)
+alias sandbox-info='cat ~/workspace/CLAUDE.md'
