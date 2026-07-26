@@ -40,6 +40,15 @@ What Claude Sandbox does give you:
 - Mounted folders can be made **read-only** with `-m path:ro`.
 - With `--worktree`, your working tree is **not mounted at all** — the agent works on a scratch branch in a separate directory.
 
+### Known limitation on Linux hosts
+
+The container runs as uid 1000. If your Linux user is a different uid, the agent
+cannot write to your bind-mounted folders — the files belong to you, not to it.
+macOS is unaffected (Docker Desktop and OrbStack map ownership), and most Linux
+single-user installs are uid 1000. If you hit it, `id -u` will show something
+other than 1000; run the sandbox from an account that is uid 1000, or open an
+issue and I will add uid remapping.
+
 ## Requirements
 
 - **Docker** — [OrbStack](https://orbstack.dev/) (recommended) or Docker Desktop

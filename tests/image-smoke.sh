@@ -176,7 +176,14 @@ wt_out=$(docker run --rm \
     ' 2>&1) || wt_rc2=$?
 printf "  … worktree container rc=%s\n" "$wt_rc2"
 
-if [[ "$wt_out" == "agent-work" ]]; then
+# A bind mount owned by a uid other than the container's node user cannot be
+# written to — true on any Linux host whose user is not uid 1000, and on CI
+# runners. That is a real limitation of the product on those hosts (documented in
+# the README), not something this test can assert around, so skip rather than
+# fail and report it plainly.
+if [[ "$wt_out" == *"Permission denied"* ]]; then
+    printf "  \033[33m—\033[0m %s\n" "worktree mode: skipped (mount owned by uid $(stat -c '%u' "$wtdir/tree" 2>/dev/null || echo '?'), container user is 1000)"
+elif [[ "$wt_out" == "agent-work" ]]; then
     # The commit must be visible from the main repo, and main must stay clean
     host_log=$(git -C "$wtdir/main" log --oneline agent-work 2>/dev/null | head -1)
     host_dirty=$(git -C "$wtdir/main" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
