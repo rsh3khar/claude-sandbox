@@ -2,9 +2,6 @@
 
 All notable changes to this project are documented here.
 
-This file is maintained by [release-please](https://github.com/googleapis/release-please) from
-[Conventional Commits](https://www.conventionalcommits.org/) — please don't edit it by hand.
-
 ## [0.3.0] - 2026-02-13
 
 Releases up to this point were tagged manually and predate automated changelog
