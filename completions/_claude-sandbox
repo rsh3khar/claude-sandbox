@@ -1,0 +1,72 @@
+#compdef claude-sandbox cs
+# zsh completion for claude-sandbox
+
+_claude_sandbox_containers() {
+    local -a names
+    names=(${(f)"$(docker ps --filter 'label=com.claude-sandbox.managed=true' --format '{{.Names}}' 2>/dev/null)"})
+    _describe 'sandbox' names
+}
+
+_claude_sandbox() {
+    local -a commands
+    commands=(
+        'run:Launch a sandbox'
+        'ps:List running sandboxes'
+        'attach:Open a second shell in a sandbox'
+        'kill:Stop sandboxes'
+        'orphans:Find sandboxes whose terminal is gone'
+        'doctor:Check host setup'
+        'update:Pull or rebuild the sandbox image'
+        'version:Print version'
+        'help:Show help'
+    )
+
+    local -a launch_opts
+    launch_opts=(
+        '(-y --yes)'{-y,--yes}'[Skip prompts, use defaults]'
+        '(-b --branch)'{-b,--branch}'[Branch to check out or create]:branch:'
+        '(-m --mount)'{-m,--mount}'[Mount an extra local repo]:path:_files -/'
+        '(-n --name)'{-n,--name}'[Container name]:name:'
+        '--auto-git[Enable auto-commit]'
+        '--no-auto-git[Disable auto-commit]'
+        '--interval[Auto-commit interval in seconds]:seconds:'
+        '--browser[Enable headless Chromium]'
+        '--no-browser[Disable headless Chromium]'
+        '--update-tools[Update agent CLIs on start]'
+        '--network[Network mode]:mode:(host bridge)'
+        '(-p --publish)'{-p,--publish}'[Publish a port]:port:'
+        '--image[Use a specific image]:image:'
+        '--pull[Force a registry pull]'
+        '--no-pull[Skip the registry pull]'
+        '--dry-run[Print the docker command and exit]'
+        '(-h --help)'{-h,--help}'[Show help]'
+        '(-v --version)'{-v,--version}'[Show version]'
+    )
+
+    _arguments -C \
+        '1: :->first' \
+        '*:: :->rest' \
+        && return 0
+
+    case $state in
+        first)
+            _alternative \
+                'commands:command:((${commands}))' \
+                'targets:target:_files -/'
+            ;;
+        rest)
+            case $words[1] in
+                attach|kill)
+                    _claude_sandbox_containers
+                    ;;
+                ps|doctor|version|help|orphans)
+                    ;;
+                *)
+                    _arguments $launch_opts '*:path:_files -/'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_claude_sandbox "$@"

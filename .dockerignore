@@ -1,0 +1,15 @@
+# Everything the image doesn't need. Keeps the build context small and stops
+# unrelated edits (docs, screenshots, git history) from busting the layer cache.
+.git
+.github
+docs
+tests
+completions
+*.png
+*.md
+!runtime/sandbox-context.md
+Makefile
+install.sh
+claude-sandbox
+.release-please-manifest.json
+release-please-config.json

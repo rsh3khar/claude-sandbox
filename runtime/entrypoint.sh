@@ -1,20 +1,38 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# Check for local mode flag
+# Claude Sandbox container entrypoint.
+#
+# Usage: entrypoint.sh <git-url>
+#        entrypoint.sh --local <repo-name>
+#
+# Environment:
+#   LOCAL_MODE            non-empty -> repo is bind-mounted, never pushed
+#   DISABLE_AUTO_GIT      non-empty -> no auto-commit daemon
+#   AUTO_GIT_INTERVAL     seconds between auto-commits (default 60)
+#   ENABLE_BROWSER        non-empty -> install Playwright + Chromium
+#   UPDATE_TOOLS          non-empty -> update agent CLIs on start
+#   SANDBOX_BRANCH        branch to check out (skips the interactive menu)
+#   SKIP_BRANCH_MENU      non-empty -> stay on the current branch
+#   GIT_USER_NAME/EMAIL   commit identity forwarded from the host
+
 LOCAL_MODE="${LOCAL_MODE:-}"
-if [[ "$1" == "--local" ]]; then
+if [[ "${1:-}" == "--local" ]]; then
     LOCAL_MODE=1
     shift
-    REPO_NAME="$1"
+    REPO_NAME="${1:-}"
     shift || true
+    if [[ -z "$REPO_NAME" ]]; then
+        echo "Usage: entrypoint.sh --local <repo-name>" >&2
+        exit 1
+    fi
 else
-    GIT_URL="$1"
+    GIT_URL="${1:-}"
     shift || true
 
     if [[ -z "$GIT_URL" ]]; then
-        echo "Usage: docker run ... <git-url>"
-        echo "       docker run ... --local <repo-name>"
+        echo "Usage: entrypoint.sh <git-url>" >&2
+        echo "       entrypoint.sh --local <repo-name>" >&2
         exit 1
     fi
 fi
@@ -41,14 +59,14 @@ run_with_spinner() {
 
     tput civis 2>/dev/null || true
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r  ${C_ACCENT}${frames[$i]}${NC} ${C_DIM}${msg}${NC}  "
+        printf "\r  %s%s%s %s%s%s  " "$C_ACCENT" "${frames[$i]}" "$NC" "$C_DIM" "$msg" "$NC"
         i=$(( (i + 1) % ${#frames[@]} ))
         sleep 0.08
     done
     tput cnorm 2>/dev/null || true
 
-    wait "$pid"
-    local exit_code=$?
+    local exit_code=0
+    wait "$pid" || exit_code=$?
     printf "\r%60s\r" ""
     return $exit_code
 }
@@ -57,11 +75,14 @@ echo ""
 echo -e "${C_ACCENT}${BOLD}◈ CLAUDE SANDBOX${NC}"
 echo ""
 
-# Open up container-local permissions — it's a sandbox, no friction.
-# SKIP host mounts: ~/.claude, ~/.aws, ~/.config/gh, ~/.codex, ~/.agents, ~/.ssh-host
-sudo chmod -R 777 /home/node/workspace 2>/dev/null || true
-sudo chmod -R 777 /usr/local/share/playwright 2>/dev/null || true
-sudo chmod -R 777 /tmp 2>/dev/null || true
+# Container-local paths only. NEVER chmod -R anything under ~/workspace: in
+# local mode those are bind mounts, and permission changes propagate straight
+# back to the user's real files on the host.
+sudo chmod 777 /home/node/workspace 2>/dev/null || true
+sudo chmod 1777 /tmp 2>/dev/null || true
+if [[ -d /usr/local/share/playwright ]]; then
+    sudo chown -R node:node /usr/local/share/playwright 2>/dev/null || true
+fi
 
 # Fix SSH socket permissions (Docker Desktop or OrbStack)
 if [[ -S "/run/host-services/ssh-auth.sock" ]]; then
@@ -71,7 +92,7 @@ if [[ -S "/tmp/ssh-agent.sock" ]]; then
     sudo chmod 666 /tmp/ssh-agent.sock 2>/dev/null || true
 fi
 
-# SSH setup
+# SSH setup — host keys are never copied in; the forwarded agent does the signing.
 mkdir -p ~/.ssh
 cp ~/.ssh-host/known_hosts ~/.ssh/ 2>/dev/null || true
 cat > ~/.ssh/config << 'SSHEOF'
@@ -82,25 +103,22 @@ SSHEOF
 chmod 700 ~/.ssh
 chmod 600 ~/.ssh/* 2>/dev/null || true
 
-# Resolve broken skill symlinks (they point to ~/.agents which isn't mounted)
+# Resolve broken skill symlinks (they point to host paths that aren't mounted)
 resolve_skill_symlinks() {
     local skills_dir="$HOME/.claude/skills"
-    [[ ! -d "$skills_dir" ]] && return
+    [[ ! -d "$skills_dir" ]] && return 0
 
+    local link name plugin_path
     for link in "$skills_dir"/*; do
         [[ ! -L "$link" ]] && continue
+        [[ -e "$link" ]] && continue
 
-        local name=$(basename "$link")
-
-        # Check if symlink target exists
-        if [[ ! -e "$link" ]]; then
-            # Try plugins cache
-            local plugin_path=$(find "$HOME/.claude/plugins" -type d -name "$name" -path "*/skills/*" 2>/dev/null | head -1)
-            if [[ -n "$plugin_path" && -d "$plugin_path" ]]; then
-                rm "$link"
-                cp -r "$plugin_path" "$skills_dir/$name"
-                echo -e "${C_DIM}Resolved skill: ${name}${NC}"
-            fi
+        name=$(basename "$link")
+        plugin_path=$(find "$HOME/.claude/plugins" -type d -name "$name" -path "*/skills/*" 2>/dev/null | head -1)
+        if [[ -n "$plugin_path" && -d "$plugin_path" ]]; then
+            rm "$link"
+            cp -r "$plugin_path" "$skills_dir/$name"
+            echo -e "${C_DIM}Resolved skill: ${name}${NC}"
         fi
     done
 }
@@ -108,61 +126,55 @@ resolve_skill_symlinks() {
 resolve_skill_symlinks
 
 if [[ -n "$LOCAL_MODE" ]]; then
-    # Local mode: repo is already mounted
     echo -e "${C_DIM}Using local repo: ${REPO_NAME}${NC}"
     cd ~/workspace/"$REPO_NAME"
 else
-    # GitHub mode: clone
     REPO_NAME=$(basename "$GIT_URL" .git)
     echo -e "${C_DIM}Cloning ${REPO_NAME}...${NC}"
     git clone --quiet "$GIT_URL" ~/workspace/"$REPO_NAME"
     cd ~/workspace/"$REPO_NAME"
 fi
 
-# Configure git identity
+# Git identity from host
 [[ -n "${GIT_USER_NAME:-}" ]] && git config user.name "$GIT_USER_NAME"
 [[ -n "${GIT_USER_EMAIL:-}" ]] && git config user.email "$GIT_USER_EMAIL"
 
-# Inject sandbox context for Claude Code and Codex
-# Place it in the workspace root (parent of repo) so it's picked up
-# without touching any repo files. Claude Code walks parent dirs for CLAUDE.md.
+# Sandbox context for the agents. Written to the workspace root (the parent of
+# the repo) so no repo file is ever touched — Claude Code and Codex both walk
+# parent directories looking for CLAUDE.md / AGENTS.md.
 SANDBOX_CTX="/usr/local/share/sandbox-context.md"
 if [[ -f "$SANDBOX_CTX" ]]; then
     cp "$SANDBOX_CTX" ~/workspace/CLAUDE.md
     cp "$SANDBOX_CTX" ~/workspace/AGENTS.md
 fi
 
-# Install & configure Playwright + Chromium (only when browser is enabled)
+# ── Browser (opt-in) ─────────────────────────────────────────────────────────
 if [[ -n "${ENABLE_BROWSER:-}" ]]; then
     echo -e "${C_DIM}Setting up browser...${NC}"
 
-    # System dependencies (always needed — container is fresh each time, but fast)
     if run_with_spinner "Installing system dependencies" sudo npx -y playwright install-deps chromium; then
         echo -e "  ${C_SUCCESS}✓${NC} System dependencies"
     else
         echo -e "  ${C_WARN}⚠${NC} System dependencies failed"
     fi
 
-    # Chromium binary (cached in Docker volume — skips download if already present)
     browser_path="${PLAYWRIGHT_BROWSERS_PATH:-/usr/local/share/playwright}"
-    if ls "$browser_path"/chromium-*/chrome-linux/chrome >/dev/null 2>&1; then
+    if compgen -G "$browser_path/chromium-*/chrome-linux/chrome" >/dev/null 2>&1; then
         echo -e "  ${C_SUCCESS}✓${NC} Chromium ${C_DIM}(cached)${NC}"
     else
-        if run_with_spinner "Downloading Chromium (first time only)" bash -c "sudo npx -y playwright install chromium"; then
+        if run_with_spinner "Downloading Chromium (first time only)" npx -y playwright install chromium; then
             echo -e "  ${C_SUCCESS}✓${NC} Chromium installed"
         else
             echo -e "  ${C_WARN}⚠${NC} Chromium install failed"
         fi
     fi
 
-    # Python Playwright client (small, always needed since container is fresh)
-    if run_with_spinner "Setting up Python Playwright" pip3 install --break-system-packages playwright; then
+    if run_with_spinner "Setting up Python Playwright" pip install playwright; then
         echo -e "  ${C_SUCCESS}✓${NC} Python Playwright"
     else
         echo -e "  ${C_WARN}⚠${NC} Python Playwright failed"
     fi
 
-    # Install MCP server globally so it shares the same browser
     if run_with_spinner "Setting up Playwright MCP" sudo npm install -g @playwright/mcp@latest; then
         echo -e "  ${C_SUCCESS}✓${NC} Playwright MCP"
     else
@@ -171,12 +183,11 @@ if [[ -n "${ENABLE_BROWSER:-}" ]]; then
 
     echo ""
 
-    # Write project-level .mcp.json so Claude Code auto-discovers it
-    # Exclude from git so auto-git doesn't commit it
-    echo '.mcp.json' >> .git/info/exclude 2>/dev/null || true
+    # Project-level .mcp.json so Claude Code auto-discovers the browser.
+    # Kept out of git so auto-save never commits it.
+    grep -qxF '.mcp.json' .git/info/exclude 2>/dev/null || echo '.mcp.json' >> .git/info/exclude 2>/dev/null || true
 
     if [ -f .mcp.json ]; then
-        # Repo already has .mcp.json — merge playwright into it
         python3 -c "
 import json
 with open('.mcp.json') as f: cfg = json.load(f)
@@ -198,44 +209,47 @@ MCPEOF
     fi
 fi
 
-# Update CLI tools if requested
+# ── Tool updates (opt-in) ────────────────────────────────────────────────────
 if [[ -n "${UPDATE_TOOLS:-}" ]]; then
     echo -e "${C_DIM}Checking for updates...${NC}"
 
-    # Claude Code
     CLAUDE_CURRENT=$(claude --version 2>/dev/null || echo "")
-    CLAUDE_LATEST=$(curl -fsSL https://claude.ai/install.sh 2>/dev/null | grep -o 'VERSION="[^"]*"' | head -1 | cut -d'"' -f2 || echo "")
-    if [[ -n "$CLAUDE_CURRENT" && "$CLAUDE_CURRENT" == *"$CLAUDE_LATEST"* && -n "$CLAUDE_LATEST" ]]; then
-        echo -e "  ${C_SUCCESS}✓${NC} Claude Code ${C_DIM}(${CLAUDE_CURRENT}, latest)${NC}"
-    else
-        if run_with_spinner "Updating Claude Code" bash -c "curl -fsSL https://claude.ai/install.sh | bash"; then
-            echo -e "  ${C_SUCCESS}✓${NC} Claude Code updated"
+    if run_with_spinner "Updating Claude Code" bash -c "curl -fsSL https://claude.ai/install.sh | bash -s latest"; then
+        CLAUDE_NEW=$(claude --version 2>/dev/null || echo "")
+        if [[ -n "$CLAUDE_CURRENT" && "$CLAUDE_CURRENT" == "$CLAUDE_NEW" ]]; then
+            echo -e "  ${C_SUCCESS}✓${NC} Claude Code ${C_DIM}(${CLAUDE_NEW:-unknown}, latest)${NC}"
         else
-            echo -e "  ${C_WARN}⚠${NC} Claude Code update failed"
+            echo -e "  ${C_SUCCESS}✓${NC} Claude Code updated ${C_DIM}(${CLAUDE_NEW:-unknown})${NC}"
         fi
+    else
+        echo -e "  ${C_WARN}⚠${NC} Claude Code update failed"
     fi
 
-    # Codex
-    CODEX_CURRENT=$(npm list -g @openai/codex --json 2>/dev/null | jq -r '.dependencies["@openai/codex"].version // empty' 2>/dev/null)
-    CODEX_LATEST=$(npm view @openai/codex@latest version 2>/dev/null || echo "")
-    if [[ -n "$CODEX_CURRENT" && "$CODEX_CURRENT" == "$CODEX_LATEST" ]]; then
-        echo -e "  ${C_SUCCESS}✓${NC} Codex ${C_DIM}(${CODEX_CURRENT}, latest)${NC}"
-    else
-        if run_with_spinner "Updating Codex" sudo npm install -g @openai/codex@latest; then
-            echo -e "  ${C_SUCCESS}✓${NC} Codex updated"
+    # Same CODEX_HOME pinning as the image build — see Dockerfile.
+    CODEX_CURRENT=$(codex --version 2>/dev/null || echo "")
+    if run_with_spinner "Updating Codex" sudo env \
+        CODEX_HOME=/opt/codex \
+        CODEX_INSTALL_DIR=/usr/local/bin \
+        CODEX_NON_INTERACTIVE=true \
+        sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | sh'; then
+        sudo chmod -R a+rX /opt/codex 2>/dev/null || true
+        CODEX_NEW=$(codex --version 2>/dev/null || echo "")
+        if [[ -n "$CODEX_CURRENT" && "$CODEX_CURRENT" == "$CODEX_NEW" ]]; then
+            echo -e "  ${C_SUCCESS}✓${NC} Codex ${C_DIM}(${CODEX_NEW:-unknown}, latest)${NC}"
         else
-            echo -e "  ${C_WARN}⚠${NC} Codex update failed"
+            echo -e "  ${C_SUCCESS}✓${NC} Codex updated ${C_DIM}(${CODEX_NEW:-unknown})${NC}"
         fi
+    else
+        echo -e "  ${C_WARN}⚠${NC} Codex update failed"
     fi
 
-    # Playwright (only if browser enabled)
     if [[ -n "${ENABLE_BROWSER:-}" ]]; then
         PW_CURRENT=$(npx playwright --version 2>/dev/null || echo "")
         PW_LATEST=$(npm view playwright@latest version 2>/dev/null || echo "")
-        if [[ -n "$PW_CURRENT" && "$PW_CURRENT" == *"$PW_LATEST"* && -n "$PW_LATEST" ]]; then
+        if [[ -n "$PW_CURRENT" && -n "$PW_LATEST" && "$PW_CURRENT" == *"$PW_LATEST"* ]]; then
             echo -e "  ${C_SUCCESS}✓${NC} Playwright ${C_DIM}(${PW_CURRENT}, latest)${NC}"
         else
-            if run_with_spinner "Updating Playwright" sudo npx -y playwright install chromium; then
+            if run_with_spinner "Updating Playwright" npx -y playwright install chromium; then
                 echo -e "  ${C_SUCCESS}✓${NC} Playwright updated"
             else
                 echo -e "  ${C_WARN}⚠${NC} Playwright update failed"
@@ -246,23 +260,36 @@ if [[ -n "${UPDATE_TOOLS:-}" ]]; then
     echo ""
 fi
 
-# Function to show branch menu
+# ── Branch selection ─────────────────────────────────────────────────────────
+checkout_or_create() {
+    local branch="$1"
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+        git checkout "$branch" --quiet
+        echo -e "${C_SUCCESS}✓${NC} Switched to ${C_ACCENT}${branch}${NC}"
+    elif [[ -z "$LOCAL_MODE" ]] && git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+        git checkout -b "$branch" --track "origin/$branch" --quiet
+        echo -e "${C_SUCCESS}✓${NC} Tracking ${C_ACCENT}${branch}${NC}"
+    else
+        git checkout -b "$branch" --quiet
+        if [[ -z "$LOCAL_MODE" ]]; then
+            git push -u origin "$branch" --quiet 2>/dev/null || true
+        fi
+        echo -e "${C_SUCCESS}✓${NC} Created ${C_ACCENT}${branch}${NC}"
+    fi
+}
+
 show_branch_menu() {
     CURRENT=$(git branch --show-current)
 
     if [[ -n "$LOCAL_MODE" ]]; then
-        # Local mode: use local branches
         ALL_BRANCHES=$(git branch --format='%(refname:short)' 2>/dev/null | sort -u)
-        # If no branches (no commits yet), use current branch name
         if [[ -z "$ALL_BRANCHES" && -n "$CURRENT" ]]; then
             ALL_BRANCHES="$CURRENT"
         fi
     else
-        # GitHub mode: use remote branches
         ALL_BRANCHES=$(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//' | sort -u)
     fi
 
-    # Count sandbox branches
     SANDBOX_BRANCHES=$(echo "$ALL_BRANCHES" | grep -E "^sandbox-" || true)
     if [[ -n "$SANDBOX_BRANCHES" ]]; then
         SANDBOX_COUNT=$(echo "$SANDBOX_BRANCHES" | wc -l | tr -d ' ')
@@ -274,13 +301,11 @@ show_branch_menu() {
     echo -e "${C_TEXT}${BOLD}Select a branch${NC}"
     echo ""
 
-    # Store branches in array for selection
     BRANCH_ARRAY=()
     while IFS= read -r b; do
         [[ -n "$b" ]] && BRANCH_ARRAY+=("$b")
     done <<< "$ALL_BRANCHES"
 
-    # Display numbered list
     for i in "${!BRANCH_ARRAY[@]}"; do
         b="${BRANCH_ARRAY[$i]}"
         num=$((i + 1))
@@ -311,10 +336,9 @@ show_branch_menu() {
     fi
 
     echo ""
-    read -p "▸ Choice [1]: " CHOICE
+    read -r -p "▸ Choice [1]: " CHOICE
     CHOICE=${CHOICE:-1}
 
-    # Handle delete
     if [[ "$CHOICE" == "d" || "$CHOICE" == "D" ]]; then
         if [[ "$SANDBOX_COUNT" -gt 0 ]]; then
             echo ""
@@ -323,23 +347,20 @@ show_branch_menu() {
                 [[ -n "$b" ]] && echo -e "  ${C_DIM}• $b${NC}"
             done
             echo ""
-            read -p "▸ Delete all? [y/N]: " CONFIRM
+            read -r -p "▸ Delete all? [y/N]: " CONFIRM
             if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
                 echo ""
                 if [[ -n "$LOCAL_MODE" ]]; then
-                    # Delete local branches
                     echo "$SANDBOX_BRANCHES" | while read -r b; do
-                        [[ -n "$b" ]] && git branch -D "$b" 2>/dev/null && echo -e "  ${C_SUCCESS}✓${NC} Deleted local $b"
+                        [[ -n "$b" && "$b" != "$CURRENT" ]] && git branch -D "$b" 2>/dev/null && echo -e "  ${C_SUCCESS}✓${NC} Deleted local $b"
                     done
                 else
-                    # Delete remote branches
                     echo "$SANDBOX_BRANCHES" | while read -r b; do
                         [[ -n "$b" ]] && git push origin --delete "$b" 2>/dev/null && echo -e "  ${C_SUCCESS}✓${NC} Deleted $b"
                     done
                 fi
             fi
         fi
-        # Refresh and show menu again
         if [[ -z "$LOCAL_MODE" ]]; then
             git fetch --prune --quiet 2>/dev/null || true
         fi
@@ -347,7 +368,6 @@ show_branch_menu() {
         return
     fi
 
-    # Handle new branch
     if [[ "$CHOICE" == "n" || "$CHOICE" == "N" || "$CHOICE" == "q" || "$CHOICE" == "Q" ]]; then
         echo ""
         echo -e "${C_DIM}Base off which branch?${NC}"
@@ -363,7 +383,6 @@ show_branch_menu() {
         done
         echo ""
 
-        # Find default base
         DEFAULT_BASE=""
         for b in "${BRANCH_ARRAY[@]}"; do
             if [[ "$b" == "main" || "$b" == "master" ]]; then
@@ -373,7 +392,7 @@ show_branch_menu() {
         done
         [[ -z "$DEFAULT_BASE" ]] && DEFAULT_BASE="${BRANCH_ARRAY[0]}"
 
-        read -p "▸ Base [${DEFAULT_BASE}]: " BASE_CHOICE
+        read -r -p "▸ Base [${DEFAULT_BASE}]: " BASE_CHOICE
 
         if [[ -z "$BASE_CHOICE" ]]; then
             BASE_BRANCH="$DEFAULT_BASE"
@@ -386,13 +405,13 @@ show_branch_menu() {
 
         git checkout "$BASE_BRANCH" --quiet 2>/dev/null || true
 
+        BRANCH_NAME=""
         if [[ "$CHOICE" == "q" || "$CHOICE" == "Q" ]]; then
-            TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-            BRANCH_NAME="sandbox-${TIMESTAMP}"
+            BRANCH_NAME="sandbox-$(date +%Y%m%d-%H%M%S)"
         else
             echo ""
             echo -e "${C_DIM}What are you working on?${NC}"
-            read -p "▸ " FEATURE_DESC
+            read -r -p "▸ " FEATURE_DESC
             if [[ -n "$FEATURE_DESC" ]]; then
                 BRANCH_NAME=$(echo "$FEATURE_DESC" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
                 [[ ! "$BRANCH_NAME" =~ ^(feature|fix|chore|docs)/ ]] && BRANCH_NAME="feature/${BRANCH_NAME}"
@@ -410,10 +429,9 @@ show_branch_menu() {
         return
     fi
 
-    # Handle number selection
     if [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
         idx=$((CHOICE - 1))
-        SELECTED="${BRANCH_ARRAY[$idx]}"
+        SELECTED="${BRANCH_ARRAY[$idx]:-}"
 
         if [[ -n "$SELECTED" && "$SELECTED" != "$CURRENT" ]]; then
             git checkout "$SELECTED" --quiet
@@ -426,18 +444,23 @@ show_branch_menu() {
     fi
 }
 
-# Run branch menu
-show_branch_menu
+if [[ -n "${SANDBOX_BRANCH:-}" ]]; then
+    echo ""
+    checkout_or_create "$SANDBOX_BRANCH"
+elif [[ -n "${SKIP_BRANCH_MENU:-}" ]]; then
+    echo ""
+    echo -e "${C_DIM}Staying on branch ${C_ACCENT}$(git branch --show-current)${NC}"
+else
+    show_branch_menu
+fi
 
 echo ""
 
-# Cleanup trap
 cleanup() {
     echo ""
     echo -e "${C_DIM}Shutting down...${NC}"
     cd ~/workspace/"$REPO_NAME" 2>/dev/null || exit 0
 
-    # Check for changes — skip if auto-git disabled
     if [[ -z "${DISABLE_AUTO_GIT:-}" ]] && [[ -n $(git status --porcelain 2>/dev/null) ]]; then
         echo -e "${C_DIM}Saving final changes...${NC}"
         git add -A
@@ -450,11 +473,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Start auto-git with repo path (pass LOCAL_MODE) unless disabled
+AUTO_GIT_INTERVAL="${AUTO_GIT_INTERVAL:-60}"
 if [[ -n "${DISABLE_AUTO_GIT:-}" ]]; then
     echo -e "${C_DIM}Auto-save: disabled${NC}"
 else
-    LOCAL_MODE="$LOCAL_MODE" auto-git 60 ~/workspace/"$REPO_NAME" > /tmp/auto-git.log 2>&1 &
+    LOCAL_MODE="$LOCAL_MODE" auto-git "$AUTO_GIT_INTERVAL" ~/workspace/"$REPO_NAME" > /tmp/auto-git.log 2>&1 &
     disown $!
 fi
 
@@ -469,9 +492,9 @@ if [[ -n "${DISABLE_AUTO_GIT:-}" ]]; then
     echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_WARN}disabled${NC}"
 else
     if [[ -n "$LOCAL_MODE" ]]; then
-        echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (local commits only)${NC}"
+        echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every ${AUTO_GIT_INTERVAL}s (local commits only)${NC}"
     else
-        echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every 60s (when changes exist)${NC}"
+        echo -e "  ${C_TEXT}Auto-save:${NC}  ${C_DIM}every ${AUTO_GIT_INTERVAL}s (when changes exist)${NC}"
     fi
 fi
 echo ""
@@ -480,37 +503,38 @@ echo -e "  ${C_DIM}Type ${C_TEXT}x${C_DIM} or ${C_TEXT}codex${C_DIM} for OpenAI 
 if [[ -n "${ENABLE_BROWSER:-}" ]]; then
     echo -e "  ${C_DIM}Browser: ${C_TEXT}Chromium (headless)${C_DIM} via Playwright${NC}"
 else
-    echo -e "  ${C_DIM}Browser: ${C_TEXT}disabled${C_DIM} (restart with browser option to enable)${NC}"
+    echo -e "  ${C_DIM}Browser: ${C_TEXT}disabled${C_DIM} (relaunch with --browser to enable)${NC}"
 fi
 echo -e "  ${C_DIM}Screenshots: save to ${C_TEXT}~/.claude/screenshots/${C_DIM} on host${NC}"
 
-# Skills summary
+# ── Skills summary ───────────────────────────────────────────────────────────
 CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
 CODEX_SKILLS_DIR="$HOME/.agents/skills"
-CLAUDE_SKILL_COUNT=0
-CODEX_SKILL_COUNT=0
 
-if [[ -d "$CLAUDE_SKILLS_DIR" ]]; then
-    CLAUDE_SKILL_COUNT=$(ls -1d "$CLAUDE_SKILLS_DIR"/*/ 2>/dev/null | wc -l | tr -d ' ')
-fi
-if [[ -d "$CODEX_SKILLS_DIR" ]]; then
-    CODEX_SKILL_COUNT=$(ls -1d "$CODEX_SKILLS_DIR"/*/ 2>/dev/null | wc -l | tr -d ' ')
-fi
+count_skills() {
+    local dir="$1"
+    [[ -d "$dir" ]] || { echo 0; return; }
+    find "$dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' '
+}
+skill_names() {
+    local dir="$1"
+    find "$dir" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort | head -4 | paste -sd ", " -
+}
 
+CLAUDE_SKILL_COUNT=$(count_skills "$CLAUDE_SKILLS_DIR")
+CODEX_SKILL_COUNT=$(count_skills "$CODEX_SKILLS_DIR")
 TOTAL_SKILLS=$((CLAUDE_SKILL_COUNT + CODEX_SKILL_COUNT))
 
 if [[ "$TOTAL_SKILLS" -gt 0 ]]; then
     SKILL_PARTS=""
     if [[ "$CLAUDE_SKILL_COUNT" -gt 0 ]]; then
-        CLAUDE_NAMES=$(ls -1d "$CLAUDE_SKILLS_DIR"/*/ 2>/dev/null | xargs -I{} basename {} | head -4 | paste -sd ", " -)
-        SKILL_PARTS="Claude: ${CLAUDE_SKILL_COUNT} (${CLAUDE_NAMES})"
+        SKILL_PARTS="Claude: ${CLAUDE_SKILL_COUNT} ($(skill_names "$CLAUDE_SKILLS_DIR"))"
     fi
     if [[ "$CODEX_SKILL_COUNT" -gt 0 ]]; then
-        CODEX_NAMES=$(ls -1d "$CODEX_SKILLS_DIR"/*/ 2>/dev/null | xargs -I{} basename {} | head -4 | paste -sd ", " -)
         if [[ -n "$SKILL_PARTS" ]]; then
-            SKILL_PARTS="${SKILL_PARTS} | Codex: ${CODEX_SKILL_COUNT} (${CODEX_NAMES})"
+            SKILL_PARTS="${SKILL_PARTS} | Codex: ${CODEX_SKILL_COUNT} ($(skill_names "$CODEX_SKILLS_DIR"))"
         else
-            SKILL_PARTS="Codex: ${CODEX_SKILL_COUNT} (${CODEX_NAMES})"
+            SKILL_PARTS="Codex: ${CODEX_SKILL_COUNT} ($(skill_names "$CODEX_SKILLS_DIR"))"
         fi
     fi
     echo -e "  ${C_DIM}Skills: ${C_TEXT}${SKILL_PARTS}${NC}"
@@ -521,13 +545,15 @@ else
     echo -e "  ${C_DIM}Browse: ${C_TEXT}https://skills.sh${NC}"
     echo -e "  ${C_DIM}Claude:  ${C_TEXT}npx skills add <owner/repo>${NC}"
     echo -e "  ${C_DIM}Codex:   ${C_TEXT}skill-installer install <name> from <source>${NC}"
-    echo ""
-    read -p "  Install popular skills now? [y/N]: " INSTALL_SKILLS
-    if [[ "$INSTALL_SKILLS" == "y" || "$INSTALL_SKILLS" == "Y" ]]; then
+    if [[ -t 0 ]]; then
         echo ""
-        npx -y skills add anthropics/claude-code-skills 2>/dev/null \
-            && echo -e "  ${C_SUCCESS}✓${NC} Claude skills installed" \
-            || echo -e "  ${C_ACCENT}⚠${NC} Claude skills install failed"
+        read -r -p "  Install popular skills now? [y/N]: " INSTALL_SKILLS
+        if [[ "$INSTALL_SKILLS" == "y" || "$INSTALL_SKILLS" == "Y" ]]; then
+            echo ""
+            npx -y skills add anthropics/claude-code-skills 2>/dev/null \
+                && echo -e "  ${C_SUCCESS}✓${NC} Claude skills installed" \
+                || echo -e "  ${C_ACCENT}⚠${NC} Claude skills install failed"
+        fi
     fi
 fi
 

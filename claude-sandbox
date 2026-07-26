@@ -8,21 +8,36 @@ set -euo pipefail
 #  ╚═══════════════════════════════════════════════════════════════════════╝
 ###############################################################################
 
-# Ensure terminal is restored on exit
+VERSION="0.3.0" # x-release-please-version
+readonly VERSION
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Constants                                                               │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+readonly IMAGE_LOCAL="claude-sandbox"
+readonly IMAGE_REGISTRY="ghcr.io/rsh3khar/claude-sandbox"
+readonly LABEL_NS="com.claude-sandbox"
+readonly CONFIG_FILE="${CLAUDE_SANDBOX_CONFIG:-$HOME/.config/claude-sandbox/config}"
+readonly REPO_CONFIG_FILE=".claude-sandbox"
+readonly BROWSER_VOLUME="claude-sandbox-browser"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+
+# Ensure terminal is restored on exit. The trap is installed only when this
+# file is executed, not sourced — an EXIT trap set at source time would
+# clobber the caller's own (bats, for one, reports results from its EXIT trap).
 cleanup_terminal() {
     tput cnorm 2>/dev/null || true  # Show cursor
     stty echo 2>/dev/null || true   # Enable echo
 }
-trap cleanup_terminal EXIT INT TERM
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │ Design System                                                           │
 # └─────────────────────────────────────────────────────────────────────────┘
 
-# Colors - Warm dark theme with amber accent (warm dark theme)
-readonly C_BG=$'\033[48;2;28;25;23m'        # Dark warm background
-readonly C_SURFACE=$'\033[48;2;41;37;33m'   # Elevated surface
-readonly C_BORDER=$'\033[38;2;68;64;60m'    # Subtle borders
+# Colors - Warm dark theme with amber accent
 readonly C_DIM=$'\033[38;2;120;113;108m'    # Muted text
 readonly C_TEXT=$'\033[38;2;214;211;209m'   # Primary text
 readonly C_BRIGHT=$'\033[38;2;250;250;249m' # Bright text
@@ -31,29 +46,41 @@ readonly C_SUCCESS=$'\033[38;2;34;197;94m'  # Green
 readonly C_ERROR=$'\033[38;2;239;68;68m'    # Red
 readonly C_WARN=$'\033[38;2;234;179;8m'     # Yellow
 readonly C_BLUE=$'\033[38;2;96;165;250m'    # Info blue
+readonly C_BORDER=$'\033[38;2;68;64;60m'    # Subtle borders
 readonly NC=$'\033[0m'
 readonly BOLD=$'\033[1m'
-readonly DIM=$'\033[2m'
 
 # Box drawing characters
 readonly TL="╭" TR="╮" BL="╰" BR="╯" H="─" V="│"
 readonly BULLET="◆" DOT="●" RING="○" CHECK="✓" CROSS="✗" ARROW="→"
 
-# State
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ State                                                                   │
+# └─────────────────────────────────────────────────────────────────────────┘
+
 SELECTED_REPO=""
 SELECTED_REPO_URL=""
 GH_USER=""
 GH_USER_DATA=""
 LOCAL_MODE=false
 LOCAL_PATH=""
-AUTO_GIT=true
-BROWSER=false
-UPDATE_TOOLS=false
-EXTRA_PATHS=()   # Additional local directories to mount
+EXTRA_PATHS=()   # Additional local directories to mount, as "path:mount_name"
 
-IMAGE_NAME="claude-sandbox"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
+# Runtime options (overridable by config file, env, then flags)
+# Auto-save is opt-in: a commit every 60s buries real history under dozens of
+# "auto-save #N" commits, which is more annoying than it is useful.
+AUTO_GIT="${CS_AUTO_GIT:-false}"
+AUTO_GIT_INTERVAL="${CS_AUTO_GIT_INTERVAL:-60}"
+BROWSER="${CS_BROWSER:-false}"
+UPDATE_TOOLS="${CS_UPDATE_TOOLS:-false}"
+NETWORK="${CS_NETWORK:-host}"
+PULL_POLICY="${CS_PULL:-auto}"   # auto | always | never
+IMAGE_REF="${CS_IMAGE:-}"
+CONTAINER_NAME=""
+SANDBOX_BRANCH="${CS_BRANCH:-}"
+PUBLISH_PORTS=()
+ASSUME_YES=false
+DRY_RUN=false
 
 # Gum styling via environment variables (amber theme)
 export GUM_CHOOSE_CURSOR="▸ "
@@ -81,12 +108,10 @@ export GUM_SPIN_SPINNER_FOREGROUND="214"
 # │ Drawing Primitives                                                      │
 # └─────────────────────────────────────────────────────────────────────────┘
 
-# Draw a box with title
 draw_box() {
-    local width=$1 title="${2:-}" padding="${3:-1}"
+    local width=$1 title="${2:-}"
     local inner=$((width - 2))
 
-    # Top border with optional title
     if [[ -n "$title" ]]; then
         local title_len=${#title}
         local left_pad=$(( (inner - title_len - 2) / 2 ))
@@ -107,7 +132,8 @@ draw_box_row() {
     local width=$1 content="$2"
     local inner=$((width - 4))
     # Strip ANSI codes and count visible characters properly
-    local stripped=$(echo -e "$content" | sed $'s/\x1b\\[[0-9;]*m//g')
+    local stripped
+    stripped=$(echo -e "$content" | sed $'s/\x1b\\[[0-9;]*m//g')
     local text_len=${#stripped}
     local padding=$((inner - text_len))
     [[ $padding -lt 0 ]] && padding=0
@@ -153,22 +179,35 @@ draw_logo() {
 }
 
 draw_mini_logo() {
-    echo -e "${C_ACCENT}${BOLD}◈ CLAUDE SANDBOX${NC}"
+    echo -e "${C_ACCENT}${BOLD}◈ CLAUDE SANDBOX${NC} ${C_DIM}v${VERSION}${NC}"
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
-# │ Status Indicators                                                       │
+# │ Output helpers                                                          │
 # └─────────────────────────────────────────────────────────────────────────┘
 
-status_dot() {
-    local status="$1"
-    case "$status" in
-        "ok")      echo -e "${C_SUCCESS}${DOT}${NC}" ;;
-        "warn")    echo -e "${C_WARN}${DOT}${NC}" ;;
-        "error")   echo -e "${C_ERROR}${DOT}${NC}" ;;
-        "pending") echo -e "${C_DIM}${RING}${NC}" ;;
-        *)         echo -e "${C_DIM}${DOT}${NC}" ;;
-    esac
+say_ok()   { echo -e "  ${C_SUCCESS}${CHECK}${NC} $*"; }
+say_warn() { echo -e "  ${C_WARN}${BULLET}${NC} $*"; }
+say_err()  { echo -e "  ${C_ERROR}${CROSS}${NC} $*" >&2; }
+say_dim()  { echo -e "  ${C_DIM}${RING}${NC} ${C_DIM}$*${NC}"; }
+
+die() {
+    say_err "$*"
+    exit 1
+}
+
+# Portable ISO-8601 -> "Mon DD". GNU date and BSD date disagree on flags.
+format_date() {
+    local iso="${1:-}"
+    [[ -z "$iso" || "$iso" == "null" ]] && return 0
+    date -d "$iso" "+%b %d" 2>/dev/null \
+        || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$iso" "+%b %d" 2>/dev/null \
+        || true
+}
+
+# Slugify a string for use in container names
+slugify() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//'
 }
 
 animate_spinner() {
@@ -177,30 +216,51 @@ animate_spinner() {
     local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
     local i=0
 
-    # Ensure cursor is restored on exit
     trap 'tput cnorm 2>/dev/null' RETURN
 
-    tput civis 2>/dev/null || true  # Hide cursor
+    tput civis 2>/dev/null || true
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r  ${C_ACCENT}${frames[$i]}${NC} ${C_DIM}${msg}${NC}  "
+        printf "\r  %s%s%s %s%s%s  " "$C_ACCENT" "${frames[$i]}" "$NC" "$C_DIM" "$msg" "$NC"
         i=$(( (i + 1) % ${#frames[@]} ))
         sleep 0.08
     done
-    printf "\r%50s\r" ""  # Clear line
-    tput cnorm 2>/dev/null || true  # Show cursor
+    printf "\r%50s\r" ""
+    tput cnorm 2>/dev/null || true
 }
 
-progress_bar() {
-    local current=$1 total=$2 width=${3:-30}
-    local pct=$((current * 100 / total))
-    local filled=$((current * width / total))
-    local empty=$((width - filled))
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Configuration                                                           │
+# └─────────────────────────────────────────────────────────────────────────┘
 
-    printf "${C_ACCENT}"
-    printf '%*s' "$filled" '' | tr ' ' '█'
-    printf "${C_DIM}"
-    printf '%*s' "$empty" '' | tr ' ' '░'
-    printf "${NC} ${C_TEXT}%3d%%${NC}" "$pct"
+# Config files are parsed, never sourced: `cs .` in an untrusted repo must not
+# be able to execute code on the host.
+readonly CONFIG_KEYS="AUTO_GIT AUTO_GIT_INTERVAL BROWSER UPDATE_TOOLS NETWORK PULL_POLICY IMAGE_REF"
+
+load_config_file() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        [[ "$line" != *=* ]] && continue
+
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%\"}"; value="${value#\"}"
+        value="${value%\'}"; value="${value#\'}"
+
+        # Allowlist keys and reject anything that isn't a plain scalar
+        [[ " $CONFIG_KEYS " == *" $key "* ]] || continue
+        [[ "$value" =~ ^[A-Za-z0-9._:/@-]*$ ]] || continue
+
+        printf -v "$key" '%s' "$value"
+    done < "$file"
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
@@ -210,9 +270,11 @@ progress_bar() {
 refresh_gh_user() {
     local tmpfile
     tmpfile=$(mktemp)
+    # Expanding $tmpfile now is deliberate: it is a local that will be gone by
+    # the time RETURN fires.
+    # shellcheck disable=SC2064
     trap "rm -f '$tmpfile'" RETURN
 
-    # Run API calls in background so we can show a spinner
     (
         if gh auth status &>/dev/null; then
             local user
@@ -259,39 +321,38 @@ draw_contribution_graph() {
     local data
     data=$(gh api graphql -f query="$query" -f username="$username" 2>/dev/null || echo "")
 
-    if [[ -z "$data" ]]; then
-        return
-    fi
+    [[ -z "$data" ]] && return 0
 
     local total
     total=$(echo "$data" | jq -r '.data.user.contributionsCollection.contributionCalendar.totalContributions // 0')
 
-    # Get last 26 weeks
-    local weeks
-    weeks=$(echo "$data" | jq -r '.data.user.contributionsCollection.contributionCalendar.weeks[-26:]')
+    # Render the last 26 weeks in one jq pass (was 182 subprocess calls)
+    local blocks
+    blocks=$(echo "$data" | jq -r '
+        .data.user.contributionsCollection.contributionCalendar.weeks[-26:]
+        | map(.contributionDays | map(.contributionCount))
+        | .[] | @tsv' 2>/dev/null)
 
-    # Build contribution map
+    [[ -z "$blocks" ]] && return 0
+
     local graph_lines=("" "" "" "" "" "" "")
-
-    for week_idx in $(seq 0 25); do
-        for day_idx in $(seq 0 6); do
-            local count
-            count=$(echo "$weeks" | jq -r ".[$week_idx].contributionDays[$day_idx].contributionCount // 0" 2>/dev/null || echo "0")
-
-            local block
+    local week counts day_idx count block
+    while IFS= read -r week; do
+        IFS=$'\t' read -r -a counts <<< "$week"
+        for day_idx in 0 1 2 3 4 5 6; do
+            count="${counts[$day_idx]:-0}"
             if [[ "$count" -eq 0 ]]; then
                 block="${C_DIM}░${NC}"
             elif [[ "$count" -le 3 ]]; then
-                block="\033[38;2;22;101;52m▒${NC}"
+                block=$'\033[38;2;22;101;52m▒'"${NC}"
             elif [[ "$count" -le 6 ]]; then
-                block="\033[38;2;34;139;34m▓${NC}"
+                block=$'\033[38;2;34;139;34m▓'"${NC}"
             else
-                block="\033[38;2;0;200;83m█${NC}"
+                block=$'\033[38;2;0;200;83m█'"${NC}"
             fi
-
-            graph_lines[$day_idx]+="$block"
+            graph_lines[day_idx]+="$block"
         done
-    done
+    done <<< "$blocks"
 
     echo ""
     echo -e "  ${C_DIM}${total} contributions this year${NC}"
@@ -307,25 +368,20 @@ draw_user_card() {
     local username="$1"
     local w=56
 
-    if [[ -z "$GH_USER_DATA" ]]; then
-        return
-    fi
+    [[ -z "$GH_USER_DATA" ]] && return 0
 
-    local name followers public_repos
+    local name followers public_repos total_private_repos
     name=$(echo "$GH_USER_DATA" | jq -r '.name // .login')
     followers=$(echo "$GH_USER_DATA" | jq -r '.followers // 0')
     public_repos=$(echo "$GH_USER_DATA" | jq -r '.public_repos // 0')
-    local total_private_repos
     total_private_repos=$(echo "$GH_USER_DATA" | jq -r '.total_private_repos // .owned_private_repos // 0')
 
-    # Fetch private repo count + contribution graph in parallel (background)
     local contrib_tmpfile
     contrib_tmpfile=$(mktemp)
 
     (draw_contribution_graph "$username" > "$contrib_tmpfile" 2>/dev/null) &
     local contrib_pid=$!
 
-    # If API didn't give us private count, fetch it (slow path)
     local private_repos="$total_private_repos"
     if [[ "$private_repos" == "0" || "$private_repos" == "null" ]]; then
         local priv_tmpfile
@@ -346,11 +402,10 @@ draw_user_card() {
     draw_box_row $w "${C_DIM}  ${BULLET} ${public_repos} public  ${BULLET} ${private_repos} private  ${BULLET} ${followers} followers${NC}"
     draw_box_bottom $w
 
-    # Wait for contribution graph to finish
     if kill -0 "$contrib_pid" 2>/dev/null; then
         animate_spinner $contrib_pid "Loading contributions..."
     fi
-    wait "$contrib_pid" 2>/dev/null
+    wait "$contrib_pid" 2>/dev/null || true
     cat "$contrib_tmpfile"
     rm -f "$contrib_tmpfile"
 }
@@ -364,26 +419,23 @@ resolve_mount_name() {
     local base="$1"
     local name="$base"
     local suffix=2
+    local primary
+    primary=$(basename "${SELECTED_REPO:-}")
 
-    # Check against primary repo
     while true; do
         local collision=false
-        if [[ "$name" == "$SELECTED_REPO" ]]; then
+        if [[ "$name" == "$primary" ]]; then
             collision=true
         fi
-        # Check against already-added extras (stored as path:mount_name pairs)
         if [[ "$collision" == false ]]; then
             for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
-                local existing_name="${ep##*:}"
-                if [[ "$name" == "$existing_name" ]]; then
+                if [[ "$name" == "${ep##*:}" ]]; then
                     collision=true
                     break
                 fi
             done
         fi
-        if [[ "$collision" == false ]]; then
-            break
-        fi
+        [[ "$collision" == false ]] && break
         name="${base}-${suffix}"
         ((suffix++))
     done
@@ -395,28 +447,25 @@ resolve_mount_name() {
 validate_and_add_extra_path() {
     local raw_path="$1"
 
-    # Expand ~ and resolve
     raw_path="${raw_path/#\~/$HOME}"
     local abs_path
     abs_path=$(cd "$raw_path" 2>/dev/null && pwd) || {
-        echo -e "  ${C_ERROR}${CROSS}${NC} Directory not found: ${raw_path}"
+        say_err "Directory not found: ${raw_path}"
         return 1
     }
 
-    if [[ ! -d "$abs_path/.git" ]]; then
-        echo -e "  ${C_ERROR}${CROSS}${NC} Not a git repository: ${abs_path}"
+    if [[ ! -e "$abs_path/.git" ]]; then
+        say_err "Not a git repository: ${abs_path}"
         return 1
     fi
 
-    # Don't allow duplicates or mounting the primary path again
     if [[ "$abs_path" == "$LOCAL_PATH" ]]; then
-        echo -e "  ${C_WARN}${BULLET}${NC} Already the primary repo: ${abs_path}"
+        say_warn "Already the primary repo: ${abs_path}"
         return 1
     fi
     for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
-        local existing_path="${ep%%:*}"
-        if [[ "$abs_path" == "$existing_path" ]]; then
-            echo -e "  ${C_WARN}${BULLET}${NC} Already added: ${abs_path}"
+        if [[ "$abs_path" == "${ep%%:*}" ]]; then
+            say_warn "Already added: ${abs_path}"
             return 1
         fi
     done
@@ -425,8 +474,157 @@ validate_and_add_extra_path() {
     mount_name=$(resolve_mount_name "$(basename "$abs_path")")
     EXTRA_PATHS+=("${abs_path}:${mount_name}")
 
-    echo -e "  ${C_SUCCESS}${CHECK}${NC} Added: ${C_ACCENT}${mount_name}${NC} ${C_DIM}(${abs_path})${NC}"
+    say_ok "Added: ${C_ACCENT}${mount_name}${NC} ${C_DIM}(${abs_path})${NC}"
     return 0
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Image Management                                                        │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+image_exists_locally() {
+    docker image inspect "$1" &>/dev/null
+}
+
+can_build_locally() {
+    [[ -f "$SCRIPT_DIR/Dockerfile" ]]
+}
+
+build_image() {
+    local extra_args=("$@")
+    echo ""
+    echo -e "  ${C_ACCENT}${BULLET}${NC} ${C_TEXT}Building sandbox image...${NC}"
+    echo ""
+    DOCKER_BUILDKIT=1 docker build \
+        --build-arg "VERSION=${VERSION}" \
+        "${extra_args[@]+"${extra_args[@]}"}" \
+        -t "$IMAGE_LOCAL" "$SCRIPT_DIR" 2>&1 | while read -r line; do
+        echo -e "    ${C_DIM}${line}${NC}"
+    done
+    echo ""
+    say_ok "Image ready"
+}
+
+pull_image() {
+    local ref="$1"
+    local tmpfile
+    tmpfile=$(mktemp)
+    (docker pull --quiet "$ref" >/dev/null 2>&1 && echo ok > "$tmpfile") &
+    animate_spinner $! "Pulling ${ref}..."
+    local result
+    result=$(cat "$tmpfile" 2>/dev/null || echo "")
+    rm -f "$tmpfile"
+    [[ "$result" == "ok" ]]
+}
+
+# Decide which image to run and make sure it exists locally.
+# Order: explicit --image > local image (unless --pull) > registry > local build
+resolve_image() {
+    if [[ -n "$IMAGE_REF" ]]; then
+        if ! image_exists_locally "$IMAGE_REF"; then
+            pull_image "$IMAGE_REF" || die "Image not found: $IMAGE_REF"
+        fi
+        return 0
+    fi
+
+    local registry_ref="${IMAGE_REGISTRY}:v${VERSION}"
+
+    if [[ "$PULL_POLICY" != "always" ]] && image_exists_locally "$IMAGE_LOCAL"; then
+        IMAGE_REF="$IMAGE_LOCAL"
+        return 0
+    fi
+
+    if [[ "$PULL_POLICY" != "never" ]] && pull_image "$registry_ref"; then
+        docker tag "$registry_ref" "$IMAGE_LOCAL" 2>/dev/null || true
+        IMAGE_REF="$registry_ref"
+        say_ok "Pulled ${C_DIM}${registry_ref}${NC}"
+        return 0
+    fi
+
+    if can_build_locally; then
+        [[ "$PULL_POLICY" == "never" ]] || say_dim "Registry unavailable — building locally"
+        build_image
+        IMAGE_REF="$IMAGE_LOCAL"
+        return 0
+    fi
+
+    die "No image available. Pull failed and no Dockerfile found in ${SCRIPT_DIR}"
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Container Naming & Discovery                                            │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+# Deterministic, collision-free container name: cs-<repo>[-N]
+generate_container_name() {
+    local base
+    base="cs-$(slugify "$(basename "${SELECTED_REPO:-sandbox}")")"
+    local name="$base"
+    local suffix=2
+    while docker ps -a --format '{{.Names}}' | grep -qx "$name"; do
+        name="${base}-${suffix}"
+        ((suffix++))
+    done
+    echo "$name"
+}
+
+# All discovery goes through our own label, not `ancestor=`: the image tag
+# changes between local builds and registry pulls, so ancestor filters silently
+# stop matching.
+list_sandbox_ids() {
+    docker ps -q --filter "label=${LABEL_NS}.managed=true"
+}
+
+pick_container() {
+    local prompt="${1:-Pick a sandbox}"
+    local names=()
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && names+=("$n")
+    done < <(docker ps --filter "label=${LABEL_NS}.managed=true" --format '{{.Names}}')
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        say_warn "No running sandboxes"
+        return 1
+    fi
+    if [[ ${#names[@]} -eq 1 ]]; then
+        echo "${names[0]}"
+        return 0
+    fi
+    printf '%s\n' "${names[@]}" | gum choose --header "$prompt" --height=10
+}
+
+resolve_container() {
+    local target="${1:-}"
+
+    if [[ -z "$target" ]]; then
+        pick_container "Pick a sandbox"
+        return
+    fi
+
+    # Exact name match
+    if docker ps -q --filter "label=${LABEL_NS}.managed=true" --filter "name=^${target}$" | grep -q .; then
+        echo "$target"
+        return 0
+    fi
+
+    # Substring match on name or workspace label
+    local matches=() id name workspace
+    for id in $(list_sandbox_ids); do
+        name=$(docker inspect --format '{{.Name}}' "$id" | sed 's|^/||')
+        workspace=$(docker inspect --format "{{index .Config.Labels \"${LABEL_NS}.workspace\"}}" "$id" 2>/dev/null || echo "")
+        if [[ "$name" == *"$target"* || "$workspace" == *"$target"* ]]; then
+            matches+=("$name")
+        fi
+    done
+
+    if [[ ${#matches[@]} -eq 0 ]]; then
+        say_err "No matching sandbox for: ${target}"
+        return 1
+    elif [[ ${#matches[@]} -eq 1 ]]; then
+        echo "${matches[0]}"
+        return 0
+    fi
+    printf '%s\n' "${matches[@]}" | gum choose --header "'${target}' matches multiple — pick one" --height=10
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
@@ -441,7 +639,7 @@ screen_welcome() {
 
     if [[ -z "$GH_USER" ]]; then
         echo ""
-        echo -e "  ${C_WARN}${BULLET}${NC} ${C_TEXT}No GitHub account found${NC}"
+        say_warn "${C_TEXT}No GitHub account found${NC}"
         echo ""
         echo -e "  ${C_DIM}Run ${C_TEXT}gh auth login${C_DIM} first${NC}"
         echo ""
@@ -480,14 +678,22 @@ screen_source_select() {
     choice=$(gum choose --height=4 "GitHub repository" "Local directory")
 
     case "$choice" in
-        "GitHub repository")
-            LOCAL_MODE=false
-            ;;
-        "Local directory")
-            LOCAL_MODE=true
-            screen_local_path
-            ;;
+        "GitHub repository") LOCAL_MODE=false ;;
+        "Local directory")   LOCAL_MODE=true; screen_local_path ;;
     esac
+}
+
+prompt_extra_mounts() {
+    while true; do
+        echo ""
+        gum confirm "Mount additional directories?" || break
+
+        local extra_input
+        extra_input=$(gum input --placeholder="Path to another git repo...")
+        [[ -z "$extra_input" ]] && break
+
+        validate_and_add_extra_path "$extra_input" || sleep 1
+    done
 }
 
 screen_local_path() {
@@ -508,54 +714,33 @@ screen_local_path() {
 
     local path_input
     path_input=$(gum input --placeholder="." --value=".")
+    [[ -z "$path_input" ]] && path_input="."
 
-    if [[ -z "$path_input" ]]; then
-        path_input="."
-    fi
-
-    # Expand ~ and resolve to absolute path
     path_input="${path_input/#\~/$HOME}"
     LOCAL_PATH=$(cd "$path_input" 2>/dev/null && pwd) || {
         echo ""
-        echo -e "  ${C_ERROR}${CROSS}${NC} Directory not found: ${path_input}"
+        say_err "Directory not found: ${path_input}"
         sleep 2
         LOCAL_MODE=false
         return
     }
 
-    # Check if it's a git repo
-    if [[ ! -d "$LOCAL_PATH/.git" ]]; then
+    if [[ ! -e "$LOCAL_PATH/.git" ]]; then
         echo ""
-        echo -e "  ${C_ERROR}${CROSS}${NC} Not a git repository: ${LOCAL_PATH}"
+        say_err "Not a git repository: ${LOCAL_PATH}"
         sleep 2
         LOCAL_MODE=false
         return
     fi
 
-    # Get repo name from directory
     SELECTED_REPO=$(basename "$LOCAL_PATH")
 
     echo ""
-    echo -e "  ${C_SUCCESS}${CHECK}${NC} Found git repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
+    say_ok "Found git repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
     sleep 1
 
-    # Offer to mount additional directories
     EXTRA_PATHS=()
-    while true; do
-        echo ""
-        if ! gum confirm "Mount additional directories?"; then
-            break
-        fi
-
-        local extra_input
-        extra_input=$(gum input --placeholder="Path to another git repo...")
-
-        if [[ -z "$extra_input" ]]; then
-            break
-        fi
-
-        validate_and_add_extra_path "$extra_input" || sleep 1
-    done
+    prompt_extra_mounts
 }
 
 screen_repo_select() {
@@ -591,13 +776,12 @@ screen_repo_select() {
     case "$choice" in
         "Search my repos")
             echo ""
-
             local repos
             repos=$(gum spin --spinner dot --title "Loading repositories..." --show-output -- \
                 gh repo list --limit 100 --json nameWithOwner --jq '.[].nameWithOwner' 2>/dev/null)
 
             if [[ -z "$repos" ]]; then
-                echo -e "  ${C_ERROR}${CROSS}${NC} No repositories found"
+                say_err "No repositories found"
                 sleep 1
                 return
             fi
@@ -605,10 +789,7 @@ screen_repo_select() {
             echo ""
             local selected
             selected=$(echo "$repos" | gum filter --placeholder="Search repos..." --height=12)
-
-            if [[ -n "$selected" ]]; then
-                confirm_repo "$selected"
-            fi
+            [[ -n "$selected" ]] && confirm_repo "$selected"
             ;;
 
         "Enter repo name")
@@ -625,7 +806,7 @@ screen_repo_select() {
                 if [[ -n "$url" ]]; then
                     confirm_repo "$name"
                 else
-                    echo -e "  ${C_ERROR}${CROSS}${NC} Repository not found"
+                    say_err "Repository not found"
                     sleep 1
                 fi
             fi
@@ -653,7 +834,6 @@ confirm_repo() {
     draw_mini_logo
     echo ""
 
-    # Fetch repo details
     local info info_tmpfile
     info_tmpfile=$(mktemp)
     (gh repo view "$repo" --json name,owner,description,stargazerCount,forkCount,primaryLanguage,pushedAt 2>/dev/null > "$info_tmpfile" || true) &
@@ -662,7 +842,7 @@ confirm_repo() {
     rm -f "$info_tmpfile"
 
     if [[ -z "$info" ]]; then
-        echo -e "  ${C_ERROR}${CROSS}${NC} Could not fetch repository info"
+        say_err "Could not fetch repository info"
         sleep 1
         return
     fi
@@ -674,18 +854,12 @@ confirm_repo() {
     stars=$(echo "$info" | jq -r '.stargazerCount // 0')
     forks=$(echo "$info" | jq -r '.forkCount // 0')
     lang=$(echo "$info" | jq -r '.primaryLanguage.name // "—"')
-    pushed=$(echo "$info" | jq -r '.pushedAt // ""')
-
-    if [[ -n "$pushed" ]]; then
-        pushed=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$pushed" "+%b %d" 2>/dev/null || echo "")
-    fi
+    pushed=$(format_date "$(echo "$info" | jq -r '.pushedAt // ""')")
 
     draw_box $w "REPOSITORY"
     draw_spacer $w
     draw_box_row $w "${C_BRIGHT}${BOLD}  ${owner}/${name}${NC}"
-    if [[ -n "$desc" ]]; then
-        draw_box_row $w "${C_DIM}  ${desc}${NC}"
-    fi
+    [[ -n "$desc" ]] && draw_box_row $w "${C_DIM}  ${desc}${NC}"
     draw_spacer $w
     draw_separator $w
     draw_spacer $w
@@ -706,110 +880,86 @@ confirm_repo() {
     fi
 }
 
-screen_launch_confirm() {
+draw_launch_summary() {
     local w=56
-
-    clear
-    echo ""
-    draw_mini_logo
-    echo ""
 
     if [[ "$LOCAL_MODE" == true ]]; then
         draw_box $w "LAUNCH SANDBOX (LOCAL)"
         draw_spacer $w
         draw_box_row $w "  ${C_DIM}Repository${NC}    ${C_BRIGHT}${SELECTED_REPO}${NC}"
         draw_box_row $w "  ${C_DIM}Path${NC}          ${C_TEXT}${LOCAL_PATH}${NC}"
-        if [[ ${#EXTRA_PATHS[@]} -gt 0 ]]; then
-            for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
-                local ep_path="${ep%%:*}"
-                local ep_name="${ep##*:}"
-                draw_box_row $w "  ${C_ACCENT}+ mounted${NC}     ${C_TEXT}${ep_name}${NC} ${C_DIM}(${ep_path})${NC}"
-            done
-        fi
-        draw_box_row $w "  ${C_DIM}Network${NC}       ${C_TEXT}host (all ports accessible)${NC}"
-        draw_spacer $w
-        draw_separator $w
-        draw_spacer $w
-        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container isolated from filesystem${NC}"
-        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Local repo mounted (changes persist)${NC}"
-        if [[ "$AUTO_GIT" == true ]]; then
-            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every 60s (local only)${NC}"
-        else
-            draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}Auto-save disabled${NC}"
-        fi
-        if [[ "$BROWSER" == true ]]; then
-            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Headless browser (Chromium)${NC}"
-        else
-            draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Headless browser disabled${NC}"
-        fi
-        if [[ "$UPDATE_TOOLS" == true ]]; then
-            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Update CLI tools on start${NC}"
-        else
-            draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}CLI tools update skipped${NC}"
-        fi
-        draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}No push to remote${NC}"
-        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
-        draw_spacer $w
-        draw_box_bottom $w
+        for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+            draw_box_row $w "  ${C_ACCENT}+ mounted${NC}     ${C_TEXT}${ep##*:}${NC} ${C_DIM}(${ep%%:*})${NC}"
+        done
     else
         draw_box $w "LAUNCH SANDBOX"
         draw_spacer $w
         draw_box_row $w "  ${C_DIM}Repository${NC}    ${C_BRIGHT}${SELECTED_REPO}${NC}"
-        draw_box_row $w "  ${C_DIM}Account${NC}       ${C_ACCENT}@${GH_USER}${NC}"
-        draw_box_row $w "  ${C_DIM}Network${NC}       ${C_TEXT}host (all ports accessible)${NC}"
-        draw_spacer $w
-        draw_separator $w
-        draw_spacer $w
-        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container isolated from filesystem${NC}"
-        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}SSH keys forwarded (never copied)${NC}"
-        if [[ "$AUTO_GIT" == true ]]; then
-            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every 60s → GitHub${NC}"
-        else
-            draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}Auto-save disabled${NC}"
-        fi
-        if [[ "$BROWSER" == true ]]; then
-            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Headless browser (Chromium)${NC}"
-        else
-            draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Headless browser disabled${NC}"
-        fi
-        if [[ "$UPDATE_TOOLS" == true ]]; then
-            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Update CLI tools on start${NC}"
-        else
-            draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}CLI tools update skipped${NC}"
-        fi
-        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
-        draw_spacer $w
-        draw_box_bottom $w
+        [[ -n "$GH_USER" ]] && draw_box_row $w "  ${C_DIM}Account${NC}       ${C_ACCENT}@${GH_USER}${NC}"
     fi
+
+    draw_box_row $w "  ${C_DIM}Network${NC}       ${C_TEXT}${NETWORK}${NC}"
+    draw_spacer $w
+    draw_separator $w
+    draw_spacer $w
+    draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Container destroyed on exit${NC}"
+
+    if [[ "$LOCAL_MODE" == true ]]; then
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Local repo mounted (changes persist)${NC}"
+        draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}No push to remote${NC}"
+    else
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}SSH keys forwarded (never copied)${NC}"
+    fi
+
+    if [[ "$AUTO_GIT" == true ]]; then
+        if [[ "$LOCAL_MODE" == true ]]; then
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every ${AUTO_GIT_INTERVAL}s (local)${NC}"
+        else
+            draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Auto-commits every ${AUTO_GIT_INTERVAL}s → GitHub${NC}"
+        fi
+    else
+        draw_box_row $w "  ${C_WARN}${CROSS}${NC} ${C_DIM}Auto-save disabled${NC}"
+    fi
+
+    if [[ "$BROWSER" == true ]]; then
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Headless browser (Chromium)${NC}"
+    else
+        draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Headless browser disabled${NC}"
+    fi
+
+    if [[ "$UPDATE_TOOLS" == true ]]; then
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_DIM}Update CLI tools on start${NC}"
+    else
+        draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}CLI tools update skipped${NC}"
+    fi
+
+    draw_spacer $w
+    draw_box_bottom $w
+}
+
+screen_launch_confirm() {
+    clear
+    echo ""
+    draw_mini_logo
+    echo ""
+
+    draw_launch_summary
 
     echo ""
     echo -e "  ${C_DIM}Claude Code will run with ${C_ACCENT}--dangerously-skip-permissions${NC}"
     echo ""
 
-    if gum confirm "Enable auto-save (commit every 60s)?"; then
-        AUTO_GIT=true
-    else
-        AUTO_GIT=false
+    if [[ "$ASSUME_YES" == true ]]; then
+        return 0
     fi
 
-    if gum confirm "Enable headless browser (Playwright)?"; then
-        BROWSER=true
-    else
-        BROWSER=false
-    fi
-
-    if gum confirm "Update CLI tools on start?"; then
-        UPDATE_TOOLS=true
-    else
-        UPDATE_TOOLS=false
-    fi
+    # Defaults follow the current values, so config/flags win and Enter is safe
+    gum confirm --default="$AUTO_GIT" "Enable auto-save (commit every ${AUTO_GIT_INTERVAL}s)?" && AUTO_GIT=true || AUTO_GIT=false
+    gum confirm --default="$BROWSER" "Enable headless browser (Playwright)?" && BROWSER=true || BROWSER=false
+    gum confirm --default="$UPDATE_TOOLS" "Update CLI tools on start?" && UPDATE_TOOLS=true || UPDATE_TOOLS=false
 
     echo ""
-
-    if ! gum confirm "Launch sandbox?"; then
-        return 1
-    fi
-
+    gum confirm "Launch sandbox?" || return 1
     return 0
 }
 
@@ -817,232 +967,200 @@ screen_launch_confirm() {
 # │ Launch Logic                                                            │
 # └─────────────────────────────────────────────────────────────────────────┘
 
-ensure_image() {
-    local inspect_result
-    inspect_result=$(mktemp)
-    (docker image inspect "$IMAGE_NAME" &>/dev/null && echo "exists" > "$inspect_result" || true) &
-    animate_spinner $! "Checking image..."
+# Build the full `docker run` argv into DOCKER_ARGS. Kept separate from
+# execution so --dry-run and the tests can inspect it.
+DOCKER_ARGS=()
 
-    if [[ "$(cat "$inspect_result" 2>/dev/null)" != "exists" ]]; then
-        rm -f "$inspect_result"
-        echo ""
-        echo -e "  ${C_ACCENT}${BULLET}${NC} ${C_TEXT}Building sandbox image...${NC}"
-        echo ""
-        docker build -t "$IMAGE_NAME" "$SCRIPT_DIR" 2>&1 | while read -r line; do
-            echo -e "    ${C_DIM}${line}${NC}"
-        done
-        echo ""
-        echo -e "  ${C_SUCCESS}${CHECK}${NC} Image ready"
+build_docker_args() {
+    DOCKER_ARGS=(run --rm -it --init)
+
+    CONTAINER_NAME="${CONTAINER_NAME:-$(generate_container_name)}"
+    DOCKER_ARGS+=(--name "$CONTAINER_NAME")
+
+    # Labels drive `cs ps` / `cs attach` / `cs kill`
+    DOCKER_ARGS+=(
+        --label "${LABEL_NS}.managed=true"
+        --label "${LABEL_NS}.version=${VERSION}"
+        --label "${LABEL_NS}.repo=${SELECTED_REPO}"
+    )
+    if [[ "$LOCAL_MODE" == true ]]; then
+        DOCKER_ARGS+=(--label "${LABEL_NS}.workspace=${LOCAL_PATH}")
+        DOCKER_ARGS+=(--label "${LABEL_NS}.mode=local")
     else
-        rm -f "$inspect_result"
+        DOCKER_ARGS+=(--label "${LABEL_NS}.mode=github")
     fi
-}
 
-launch_sandbox() {
-    clear
-    echo ""
-    draw_mini_logo
-    echo ""
-
-    echo -e "  ${C_ACCENT}▸${NC} Preparing sandbox..."
-    ensure_image
-
-    echo -e "  ${C_ACCENT}▸${NC} Launching container..."
-    echo ""
-
-    # SSH agent forwarding - detect socket location
-    local ssh_args=()
-    if [[ -S "/run/host-services/ssh-auth.sock" ]]; then
-        # Docker Desktop on macOS
-        ssh_args=(
-            "-v" "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock"
-            "-e" "SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock"
-        )
-    elif [[ -n "$SSH_AUTH_SOCK" && -S "$SSH_AUTH_SOCK" ]]; then
-        # OrbStack / native macOS agent - mount the actual socket
-        ssh_args=(
-            "-v" "$SSH_AUTH_SOCK:/tmp/ssh-agent.sock"
-            "-e" "SSH_AUTH_SOCK=/tmp/ssh-agent.sock"
-        )
+    if [[ "$NETWORK" == "host" ]]; then
+        DOCKER_ARGS+=(--network host)
+    else
+        DOCKER_ARGS+=(--network "$NETWORK")
+        for p in ${PUBLISH_PORTS[@]+"${PUBLISH_PORTS[@]}"}; do
+            DOCKER_ARGS+=(-p "$p")
+        done
     fi
+
+    DOCKER_ARGS+=(-e "TERM=${TERM:-xterm-256color}" -e "CLAUDE_SANDBOX=1")
 
     # Git identity from host
     local git_name git_email
     git_name=$(git config --global user.name 2>/dev/null || echo "")
     git_email=$(git config --global user.email 2>/dev/null || echo "")
+    DOCKER_ARGS+=(-e "GIT_USER_NAME=$git_name" -e "GIT_USER_EMAIL=$git_email")
 
-    # Auth for Claude (read from secure file or env)
-    local auth_args=()
+    # SSH agent forwarding — socket location differs per Docker runtime
+    if [[ -S "/run/host-services/ssh-auth.sock" ]]; then
+        DOCKER_ARGS+=(
+            -v "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock"
+            -e "SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock"
+        )
+    elif [[ -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK}" ]]; then
+        DOCKER_ARGS+=(
+            -v "$SSH_AUTH_SOCK:/tmp/ssh-agent.sock"
+            -e "SSH_AUTH_SOCK=/tmp/ssh-agent.sock"
+        )
+    fi
+
+    # Host config mounts (each guarded — only mounted if present)
+    [[ -d "$HOME/.claude" ]]     && DOCKER_ARGS+=(-v "$HOME/.claude:/home/node/.claude")
+    [[ -d "$HOME/.ssh" ]]        && DOCKER_ARGS+=(-v "$HOME/.ssh:/home/node/.ssh-host:ro")
+    [[ -d "$HOME/.aws" ]]        && DOCKER_ARGS+=(-v "$HOME/.aws:/home/node/.aws")
+    [[ -d "$HOME/.config/gh" ]]  && DOCKER_ARGS+=(-v "$HOME/.config/gh:/home/node/.config/gh:ro")
+    [[ -d "$HOME/.codex" ]]      && DOCKER_ARGS+=(-v "$HOME/.codex:/home/node/.codex")
+    [[ -d "$HOME/.agents" ]]     && DOCKER_ARGS+=(-v "$HOME/.agents:/home/node/.agents")
+
+    # AWS env passthrough
+    [[ -n "${AWS_PROFILE:-}" ]]        && DOCKER_ARGS+=(-e "AWS_PROFILE=$AWS_PROFILE")
+    [[ -n "${AWS_DEFAULT_REGION:-}" ]] && DOCKER_ARGS+=(-e "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION")
+    [[ -n "${AWS_REGION:-}" ]]         && DOCKER_ARGS+=(-e "AWS_REGION=$AWS_REGION")
+
+    # Feature toggles
+    [[ "$AUTO_GIT" == false ]]    && DOCKER_ARGS+=(-e "DISABLE_AUTO_GIT=1")
+    [[ "$AUTO_GIT" == true ]]     && DOCKER_ARGS+=(-e "AUTO_GIT_INTERVAL=$AUTO_GIT_INTERVAL")
+    [[ "$UPDATE_TOOLS" == true ]] && DOCKER_ARGS+=(-e "UPDATE_TOOLS=1")
+    [[ -n "$SANDBOX_BRANCH" ]]    && DOCKER_ARGS+=(-e "SANDBOX_BRANCH=$SANDBOX_BRANCH")
+    [[ "$ASSUME_YES" == true && -z "$SANDBOX_BRANCH" ]] && DOCKER_ARGS+=(-e "SKIP_BRANCH_MENU=1")
+
+    if [[ "$BROWSER" == true ]]; then
+        DOCKER_ARGS+=(
+            --shm-size=256m
+            -e "ENABLE_BROWSER=1"
+            -v "${BROWSER_VOLUME}:/usr/local/share/playwright"
+        )
+    fi
+
+    # Auth (never echoed back to the terminal)
     local oauth_token="${CLAUDE_CODE_OAUTH_TOKEN:-}"
-
-    # Try reading from secure file if env not set
     if [[ -z "$oauth_token" && -f "$HOME/.claude-sandbox-token" ]]; then
-        oauth_token=$(cat "$HOME/.claude-sandbox-token" 2>/dev/null | tr -d '\n')
+        oauth_token=$(tr -d '\n' < "$HOME/.claude-sandbox-token" 2>/dev/null || echo "")
     fi
-
     if [[ -n "$oauth_token" ]]; then
-        auth_args+=("-e" "CLAUDE_CODE_OAUTH_TOKEN=$oauth_token")
-        echo -e "  ${C_SUCCESS}${CHECK}${NC} Using OAuth token"
+        DOCKER_ARGS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$oauth_token")
     elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-        auth_args+=("-e" "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
-        echo -e "  ${C_SUCCESS}${CHECK}${NC} Using API key"
+        DOCKER_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+    fi
+
+    local gh_token
+    gh_token=$(gh auth token 2>/dev/null | tr -d '\n' || echo "")
+    [[ -n "$gh_token" ]] && DOCKER_ARGS+=(-e "GH_TOKEN=$gh_token")
+
+    # Workspace mounts + entrypoint args
+    if [[ "$LOCAL_MODE" == true ]]; then
+        DOCKER_ARGS+=(-e "LOCAL_MODE=1")
+        DOCKER_ARGS+=(-v "$LOCAL_PATH:/home/node/workspace/$SELECTED_REPO")
+        for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+            DOCKER_ARGS+=(-v "${ep%%:*}:/home/node/workspace/${ep##*:}")
+        done
+        DOCKER_ARGS+=("$IMAGE_REF" "--local" "$SELECTED_REPO")
     else
-        echo -e "  ${C_WARN}${BULLET}${NC} ${C_DIM}No auth - run 'claude setup-token' and save to ~/.claude-sandbox-token${NC}"
+        DOCKER_ARGS+=("$IMAGE_REF" "$SELECTED_REPO_URL")
     fi
+}
 
-    # Optional host config mounts (AWS, gh CLI)
-    local extra_mounts=()
-
-    # Resolve GitHub token in background
-    local gh_tmpfile
-    gh_tmpfile=$(mktemp)
-
-    (gh auth token 2>/dev/null > "$gh_tmpfile" || true) &
-    local gh_pid=$!
-
-    # Claude config (should always exist, but guard anyway)
-    if [[ -d "$HOME/.claude" ]]; then
-        extra_mounts+=("-v" "$HOME/.claude:/home/node/.claude")
-    fi
-
-    # SSH keys for git operations
-    if [[ -d "$HOME/.ssh" ]]; then
-        extra_mounts+=("-v" "$HOME/.ssh:/home/node/.ssh-host:ro")
-    fi
-
-    # AWS: bind-mount ~/.aws so container always sees host's current credentials.
-    # No static credential export — env vars go stale in long-running containers.
-    # The SDK reads directly from the mounted config/SSO cache, so when the host
-    # refreshes (aws sso login), the container picks it up immediately.
-    if [[ -d "$HOME/.aws" ]]; then
-        extra_mounts+=("-v" "$HOME/.aws:/home/node/.aws")
-        # Validate that current session is active
-        if aws sts get-caller-identity &>/dev/null; then
-            echo -e "  ${C_SUCCESS}${CHECK}${NC} AWS credentials mounted (live session)"
+# Print the docker command with secrets masked
+print_docker_command() {
+    local out="docker" arg
+    for arg in "${DOCKER_ARGS[@]}"; do
+        case "$arg" in
+            CLAUDE_CODE_OAUTH_TOKEN=*) arg="CLAUDE_CODE_OAUTH_TOKEN=***" ;;
+            ANTHROPIC_API_KEY=*)       arg="ANTHROPIC_API_KEY=***" ;;
+            GH_TOKEN=*)                arg="GH_TOKEN=***" ;;
+        esac
+        if [[ "$arg" =~ [[:space:]] ]]; then
+            out+=" '$arg'"
         else
-            echo -e "  ${C_WARN}${BULLET}${NC} ${C_DIM}AWS config mounted (no active session — run ${C_TEXT}aws sso login${C_DIM} on host)${NC}"
+            out+=" $arg"
+        fi
+    done
+    echo "$out"
+}
+
+report_launch_context() {
+    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" || -f "$HOME/.claude-sandbox-token" ]]; then
+        say_ok "Using OAuth token"
+    elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        say_ok "Using API key"
+    else
+        say_warn "${C_DIM}No auth — run 'claude setup-token' and save to ~/.claude-sandbox-token${NC}"
+    fi
+
+    if [[ -d "$HOME/.aws" ]]; then
+        if aws sts get-caller-identity &>/dev/null; then
+            say_ok "AWS credentials mounted (live session)"
+        else
+            say_warn "${C_DIM}AWS config mounted (no active session — run ${C_TEXT}aws sso login${C_DIM} on host)${NC}"
         fi
     fi
-    # Forward AWS_PROFILE / AWS_DEFAULT_REGION if set on host
-    [[ -n "${AWS_PROFILE:-}" ]] && auth_args+=("-e" "AWS_PROFILE=$AWS_PROFILE")
-    [[ -n "${AWS_DEFAULT_REGION:-}" ]] && auth_args+=("-e" "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION")
-    [[ -n "${AWS_REGION:-}" ]] && auth_args+=("-e" "AWS_REGION=$AWS_REGION")
 
-    animate_spinner $gh_pid "Forwarding credentials..."
-
-    # GitHub CLI: mount config for settings, then extract token from keyring
-    if [[ -d "$HOME/.config/gh" ]]; then
-        extra_mounts+=("-v" "$HOME/.config/gh:/home/node/.config/gh:ro")
-    fi
-
-    # Codex CLI config (only if exists)
-    if [[ -d "$HOME/.codex" ]]; then
-        extra_mounts+=("-v" "$HOME/.codex:/home/node/.codex")
-    fi
-
-    # Codex skills directory (only if exists)
-    if [[ -d "$HOME/.agents" ]]; then
-        extra_mounts+=("-v" "$HOME/.agents:/home/node/.agents")
-    fi
-    local gh_token
-    gh_token=$(cat "$gh_tmpfile" 2>/dev/null | tr -d '\n' || echo "")
-    rm -f "$gh_tmpfile"
-    if [[ -n "$gh_token" ]]; then
-        auth_args+=("-e" "GH_TOKEN=$gh_token")
-        echo -e "  ${C_SUCCESS}${CHECK}${NC} GitHub CLI token forwarded"
+    if gh auth token &>/dev/null; then
+        say_ok "GitHub CLI token forwarded"
     elif [[ -d "$HOME/.config/gh" ]]; then
-        echo -e "  ${C_WARN}${BULLET}${NC} ${C_DIM}GitHub config mounted (token in keyring not accessible — run ${C_TEXT}gh auth login${C_DIM})${NC}"
+        say_warn "${C_DIM}GitHub config mounted (token in keyring not accessible)${NC}"
     fi
 
-    # Auto-git toggle
-    local auto_git_args=()
-    if [[ "$AUTO_GIT" == false ]]; then
-        auto_git_args+=("-e" "DISABLE_AUTO_GIT=1")
-        echo -e "  ${C_WARN}${BULLET}${NC} Auto-save disabled"
-    else
-        echo -e "  ${C_SUCCESS}${CHECK}${NC} Auto-save enabled"
-    fi
-
-    # Browser toggle
-    local browser_args=()
-    if [[ "$BROWSER" == true ]]; then
-        browser_args+=("--shm-size=256m" "-e" "ENABLE_BROWSER=1")
-        # Named volume caches Chromium binary across sessions
-        browser_args+=("-v" "claude-sandbox-browser:/usr/local/share/playwright")
-        echo -e "  ${C_SUCCESS}${CHECK}${NC} Headless browser enabled"
-    else
-        echo -e "  ${C_DIM}${RING}${NC} Browser disabled"
-    fi
-
-    # Update tools toggle
-    local update_args=()
-    if [[ "$UPDATE_TOOLS" == true ]]; then
-        update_args+=("-e" "UPDATE_TOOLS=1")
-        echo -e "  ${C_SUCCESS}${CHECK}${NC} Will update tools on start"
-    fi
+    [[ "$AUTO_GIT" == true ]] && say_ok "Auto-save enabled" || say_warn "Auto-save disabled"
+    [[ "$BROWSER" == true ]] && say_ok "Headless browser enabled" || say_dim "Browser disabled"
+    [[ "$UPDATE_TOOLS" == true ]] && say_ok "Will update tools on start"
 
     if [[ "$LOCAL_MODE" == true ]]; then
-        # Local mode: bind mount the repo, pass --local flag
-        echo -e "  ${C_SUCCESS}${CHECK}${NC} Local mode: mounting ${LOCAL_PATH}"
-
-        # Build extra repo mount args
-        local extra_repo_mounts=()
+        say_ok "Local mode: mounting ${LOCAL_PATH}"
         for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
-            local ep_path="${ep%%:*}"
-            local ep_name="${ep##*:}"
-            extra_repo_mounts+=("-v" "$ep_path:/home/node/workspace/$ep_name")
-            echo -e "  ${C_SUCCESS}${CHECK}${NC} Extra mount: ${ep_name}"
+            say_ok "Extra mount: ${ep##*:}"
         done
+    fi
+}
 
-        docker run --rm -it --init \
-            --network host \
-            ${browser_args[@]+"${browser_args[@]}"} \
-            -e "TERM=${TERM:-xterm-256color}" \
-            -e "CLAUDE_SANDBOX=1" \
-            -e "LOCAL_MODE=1" \
-            -v "$LOCAL_PATH:/home/node/workspace/$SELECTED_REPO" \
-            ${extra_repo_mounts[@]+"${extra_repo_mounts[@]}"} \
-            -e "GIT_USER_NAME=$git_name" \
-            -e "GIT_USER_EMAIL=$git_email" \
-            "${auth_args[@]}" \
-            "${ssh_args[@]}" \
-            "${extra_mounts[@]}" \
-            "${auto_git_args[@]}" \
-            ${update_args[@]+"${update_args[@]}"} \
-            "$IMAGE_NAME" \
-            "--local" "$SELECTED_REPO"
-
-        # After exit (local mode)
+launch_sandbox() {
+    if [[ "$DRY_RUN" != true ]]; then
+        clear
         echo ""
-        echo -e "  ${C_SUCCESS}${CHECK}${NC} ${C_TEXT}Container destroyed${NC}"
-        echo -e "  ${C_DIM}  Your changes are on a local branch${NC}"
+        draw_mini_logo
         echo ""
-    else
-        # GitHub mode: clone from URL
-        docker run --rm -it --init \
-            --network host \
-            ${browser_args[@]+"${browser_args[@]}"} \
-            -e "TERM=${TERM:-xterm-256color}" \
-            -e "CLAUDE_SANDBOX=1" \
-            -e "GIT_USER_NAME=$git_name" \
-            -e "GIT_USER_EMAIL=$git_email" \
-            "${auth_args[@]}" \
-            "${ssh_args[@]}" \
-            "${extra_mounts[@]}" \
-            "${auto_git_args[@]}" \
-            ${update_args[@]+"${update_args[@]}"} \
-            "$IMAGE_NAME" \
-            "$SELECTED_REPO_URL"
-
-        # After exit (GitHub mode)
-        echo ""
-        echo -e "  ${C_SUCCESS}${CHECK}${NC} ${C_TEXT}Container destroyed${NC}"
-        echo -e "  ${C_DIM}  Your changes are safely on GitHub${NC}"
-        echo ""
+        echo -e "  ${C_ACCENT}▸${NC} Preparing sandbox..."
     fi
 
-    echo -e "  ${C_DIM}Press Enter to continue...${NC}"
-    read -r
+    resolve_image
+    build_docker_args
+
+    if [[ "$DRY_RUN" == true ]]; then
+        print_docker_command
+        return 0
+    fi
+
+    report_launch_context
+
+    echo -e "  ${C_ACCENT}▸${NC} Launching ${C_ACCENT}${CONTAINER_NAME}${NC}..."
+    echo ""
+
+    docker "${DOCKER_ARGS[@]}"
+
+    echo ""
+    say_ok "${C_TEXT}Container destroyed${NC}"
+    if [[ "$LOCAL_MODE" == true ]]; then
+        echo -e "  ${C_DIM}  Your changes are on a local branch${NC}"
+    else
+        echo -e "  ${C_DIM}  Your changes are safely on GitHub${NC}"
+    fi
+    echo ""
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
@@ -1058,7 +1176,6 @@ screen_main_menu() {
         draw_mini_logo
         echo ""
 
-        # Status card
         draw_box $w "STATUS"
         draw_spacer $w
 
@@ -1068,8 +1185,7 @@ screen_main_menu() {
                 draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Repository${NC}    ${C_TEXT}${SELECTED_REPO}${NC}"
                 draw_box_row $w "  ${C_DIM}  ${NC} ${C_DIM}Path${NC}          ${C_DIM}${LOCAL_PATH}${NC}"
                 for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
-                    local ep_name="${ep##*:}"
-                    draw_box_row $w "  ${C_ACCENT}  ${NC} ${C_DIM}+ mounted${NC}     ${C_TEXT}${ep_name}${NC}"
+                    draw_box_row $w "  ${C_ACCENT}  ${NC} ${C_DIM}+ mounted${NC}     ${C_TEXT}${ep##*:}${NC}"
                 done
             else
                 draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Repository${NC}    ${C_DIM}None selected${NC}"
@@ -1088,75 +1204,66 @@ screen_main_menu() {
             fi
         fi
 
-        draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Network${NC}       ${C_TEXT}host mode${NC}"
+        local running
+        running=$(list_sandbox_ids | wc -l | tr -d ' ')
+        draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Network${NC}       ${C_TEXT}${NETWORK}${NC}"
+        draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}Running${NC}       ${C_TEXT}${running} sandbox(es)${NC}"
         draw_spacer $w
         draw_box_bottom $w
 
         echo ""
 
-        # Build menu options
         local options=()
-
         if [[ "$LOCAL_MODE" == true ]]; then
-            if [[ -n "$SELECTED_REPO" ]]; then
-                options+=("🚀  Launch Sandbox")
-            fi
+            [[ -n "$SELECTED_REPO" ]] && options+=("🚀  Launch Sandbox")
             options+=("📂  Select Directory")
             options+=("🔄  Switch to GitHub")
-            options+=("🔧  Rebuild Image")
-            options+=("❌  Exit")
         else
-            if [[ -n "$SELECTED_REPO" && -n "$GH_USER" ]]; then
-                options+=("🚀  Launch Sandbox")
-            fi
+            [[ -n "$SELECTED_REPO" && -n "$GH_USER" ]] && options+=("🚀  Launch Sandbox")
             options+=("📂  Select Repository")
             options+=("🔄  Switch to Local")
             options+=("👤  Switch Account")
-            options+=("🔧  Rebuild Image")
-            options+=("❌  Exit")
         fi
+        [[ "$running" -gt 0 ]] && options+=("📋  Running Sandboxes")
+        options+=("🔧  Rebuild Image")
+        options+=("❌  Exit")
 
         local choice
-        choice=$(printf '%s\n' "${options[@]}" | gum choose --height=8)
+        choice=$(printf '%s\n' "${options[@]}" | gum choose --height=10)
 
         case "$choice" in
             "🚀  Launch Sandbox")
                 if screen_launch_confirm; then
                     launch_sandbox
+                    echo -e "  ${C_DIM}Press Enter to continue...${NC}"
+                    read -r
                 fi
                 ;;
-            "📂  Select Repository")
-                screen_repo_select
-                ;;
-            "📂  Select Directory")
-                screen_local_path
-                ;;
+            "📂  Select Repository") screen_repo_select ;;
+            "📂  Select Directory")  screen_local_path ;;
             "🔄  Switch to GitHub")
                 LOCAL_MODE=false
-                LOCAL_PATH=""
-                SELECTED_REPO=""
-                SELECTED_REPO_URL=""
-                EXTRA_PATHS=()
+                LOCAL_PATH=""; SELECTED_REPO=""; SELECTED_REPO_URL=""; EXTRA_PATHS=()
+                [[ -z "$GH_USER" ]] && refresh_gh_user
                 ;;
             "🔄  Switch to Local")
                 LOCAL_MODE=true
-                SELECTED_REPO=""
-                SELECTED_REPO_URL=""
-                EXTRA_PATHS=()
+                SELECTED_REPO=""; SELECTED_REPO_URL=""; EXTRA_PATHS=()
                 screen_local_path
                 ;;
-            "👤  Switch Account")
-                screen_switch_account
+            "👤  Switch Account") screen_switch_account ;;
+            "📋  Running Sandboxes")
+                echo ""
+                cmd_ps
+                echo ""
+                echo -e "  ${C_DIM}Press Enter to continue...${NC}"
+                read -r
                 ;;
             "🔧  Rebuild Image")
                 echo ""
                 echo -e "  ${C_ACCENT}${BULLET}${NC} ${C_TEXT}Rebuilding sandbox image (no cache)...${NC}"
-                echo ""
-                docker build --no-cache -t "$IMAGE_NAME" "$SCRIPT_DIR" 2>&1 | while read -r line; do
-                    echo -e "    ${C_DIM}${line}${NC}"
-                done
-                echo ""
-                echo -e "  ${C_SUCCESS}${CHECK}${NC} Image rebuilt with latest versions"
+                can_build_locally || die "No Dockerfile in ${SCRIPT_DIR} — install with --link for dev mode"
+                build_image --no-cache
                 echo ""
                 echo -e "  ${C_DIM}Press Enter to continue...${NC}"
                 read -r
@@ -1184,7 +1291,7 @@ screen_switch_account() {
     accounts=$(get_all_accounts)
 
     if [[ -z "$accounts" ]]; then
-        echo -e "  ${C_WARN}${BULLET}${NC} No accounts found"
+        say_warn "No accounts found"
         echo ""
         echo -e "  ${C_DIM}Run ${C_TEXT}gh auth login${C_DIM} to add an account${NC}"
         echo ""
@@ -1199,10 +1306,8 @@ screen_switch_account() {
     draw_box_bottom $w
     echo ""
 
-    accounts=$(echo -e "${accounts}\n+ Add new account")
-
     local selected
-    selected=$(echo "$accounts" | gum choose --height=6)
+    selected=$(printf '%s\n+ Add new account\n' "$accounts" | gum choose --height=6)
 
     if [[ "$selected" == "+ Add new account" ]]; then
         gh auth login
@@ -1224,24 +1329,213 @@ screen_switch_account() {
     fi
 }
 
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Subcommands                                                             │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+cmd_ps() {
+    local ids
+    ids=$(list_sandbox_ids)
+
+    if [[ -z "$ids" ]]; then
+        say_dim "No running sandboxes"
+        return 0
+    fi
+
+    printf "  %-22s %-10s %-8s %s\n" "NAME" "STARTED" "MODE" "WORKSPACES"
+
+    local id name started mode workspaces first
+    for id in $ids; do
+        name=$(docker inspect --format '{{.Name}}' "$id" | sed 's|^/||')
+        started=$(docker inspect --format '{{.State.StartedAt}}' "$id" | cut -dT -f1)
+        mode=$(docker inspect --format "{{index .Config.Labels \"${LABEL_NS}.mode\"}}" "$id" 2>/dev/null || echo "-")
+        workspaces=$(docker inspect --format '{{range .Mounts}}{{.Destination}}={{.Source}}{{println}}{{end}}' "$id" \
+            | grep '^/home/node/workspace/' | cut -d= -f2- | sort)
+
+        first=1
+        while IFS= read -r m; do
+            [[ -z "$m" ]] && continue
+            if [[ "$first" == "1" ]]; then
+                printf "  ${C_ACCENT}%-22s${NC} %-10s %-8s %s\n" "$name" "$started" "$mode" "$m"
+                first=0
+            else
+                printf "  %-22s %-10s %-8s %s\n" "" "" "" "$m"
+            fi
+        done <<< "$workspaces"
+
+        [[ "$first" == "1" ]] && printf "  ${C_ACCENT}%-22s${NC} %-10s %-8s %s\n" "$name" "$started" "$mode" "(cloned in container)"
+    done
+}
+
+cmd_attach() {
+    local name
+    name=$(resolve_container "${1:-}") || return 1
+    [[ -z "$name" ]] && return 1
+
+    echo -e "  ${C_DIM}Attaching to ${C_ACCENT}${name}${C_DIM}...${NC}"
+    docker exec -it "$name" zsh
+}
+
+cmd_kill() {
+    local target="${1:-}"
+
+    if [[ "$target" == "--all" || "$target" == "-a" ]]; then
+        local ids
+        ids=$(list_sandbox_ids)
+        [[ -z "$ids" ]] && { say_dim "No running sandboxes"; return 0; }
+
+        if [[ "$ASSUME_YES" != true ]]; then
+            echo ""
+            cmd_ps
+            echo ""
+            gum confirm "Kill all running sandboxes?" || return 0
+        fi
+        # shellcheck disable=SC2086
+        docker rm -f $ids >/dev/null
+        say_ok "Killed all sandboxes"
+        return 0
+    fi
+
+    local name
+    name=$(resolve_container "$target") || return 1
+    [[ -z "$name" ]] && return 1
+
+    if [[ "$ASSUME_YES" != true ]]; then
+        gum confirm "Kill ${name}?" || return 0
+    fi
+    docker rm -f "$name" >/dev/null
+    say_ok "Killed ${name}"
+}
+
+# A sandbox whose terminal is gone still holds mounts and can keep auto-committing.
+cmd_orphans() {
+    local clients
+    clients=$(ps -axo command 2>/dev/null | grep -E "docker (run|exec|attach)" | grep -v grep || true)
+
+    local found=0 id name
+    for id in $(list_sandbox_ids); do
+        name=$(docker inspect --format '{{.Name}}' "$id" | sed 's|^/||')
+        if grep -qF -- "$name" <<< "$clients"; then
+            printf "  %-22s ${C_SUCCESS}attached${NC}\n" "$name"
+        else
+            printf "  %-22s ${C_WARN}ORPHAN${NC} ${C_DIM}(no docker client found)${NC}\n" "$name"
+            found=1
+        fi
+    done
+
+    if [[ "$found" == "1" ]]; then
+        echo ""
+        echo -e "  ${C_DIM}Kill one with:  ${C_TEXT}cs kill <name>${NC}"
+        echo -e "  ${C_DIM}Kill them all:  ${C_TEXT}cs kill --all${NC}"
+    elif [[ -z "$(list_sandbox_ids)" ]]; then
+        say_dim "No running sandboxes"
+    fi
+}
+
+cmd_doctor() {
+    echo ""
+    draw_mini_logo
+    echo ""
+    echo -e "  ${C_TEXT}${BOLD}Host checks${NC}"
+    echo ""
+
+    local ok=true
+
+    for dep in docker gh gum jq git; do
+        if command -v "$dep" &>/dev/null; then
+            say_ok "${dep} ${C_DIM}($(command -v "$dep"))${NC}"
+        else
+            say_err "${dep} missing"
+            ok=false
+        fi
+    done
+
+    if docker info &>/dev/null; then
+        local runtime
+        runtime=$(docker info --format '{{.Name}}' 2>/dev/null || echo "unknown")
+        say_ok "Docker daemon reachable ${C_DIM}(${runtime})${NC}"
+        if docker info --format '{{json .}}' 2>/dev/null | grep -qi orbstack; then
+            say_ok "OrbStack detected ${C_DIM}(host networking supported)${NC}"
+        else
+            say_warn "${C_DIM}Not OrbStack — Docker Desktop needs host networking enabled in Settings > Resources > Network, or use ${C_TEXT}--network bridge -p PORT:PORT${NC}"
+        fi
+    else
+        say_err "Docker daemon not reachable"
+        ok=false
+    fi
+
+    if gh auth status &>/dev/null; then
+        say_ok "GitHub CLI authenticated"
+    else
+        say_warn "GitHub CLI not authenticated ${C_DIM}(run: gh auth login)${NC}"
+    fi
+
+    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+        say_ok "Claude auth via CLAUDE_CODE_OAUTH_TOKEN"
+    elif [[ -f "$HOME/.claude-sandbox-token" ]]; then
+        local perms
+        perms=$(stat -f '%Lp' "$HOME/.claude-sandbox-token" 2>/dev/null || stat -c '%a' "$HOME/.claude-sandbox-token" 2>/dev/null || echo "?")
+        if [[ "$perms" == "600" ]]; then
+            say_ok "Token file present ${C_DIM}(chmod 600)${NC}"
+        else
+            say_warn "Token file is chmod ${perms} ${C_DIM}— run: chmod 600 ~/.claude-sandbox-token${NC}"
+        fi
+    elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        say_ok "Claude auth via ANTHROPIC_API_KEY"
+    else
+        say_warn "No Claude auth ${C_DIM}(run: claude setup-token)${NC}"
+    fi
+
+    if ssh-add -l &>/dev/null; then
+        say_ok "SSH agent has keys loaded"
+    else
+        say_warn "SSH agent has no keys ${C_DIM}(run: ssh-add)${NC}"
+    fi
+
+    if image_exists_locally "$IMAGE_LOCAL"; then
+        local created
+        created=$(docker image inspect "$IMAGE_LOCAL" --format '{{.Created}}' | cut -dT -f1)
+        say_ok "Image present ${C_DIM}(built ${created})${NC}"
+    else
+        say_warn "No local image ${C_DIM}(will pull or build on first launch)${NC}"
+    fi
+
+    echo ""
+    [[ "$ok" == true ]] && say_ok "${C_TEXT}Ready${NC}" || say_err "Some checks failed"
+    echo ""
+}
+
+cmd_update() {
+    echo ""
+    draw_mini_logo
+    echo ""
+
+    local registry_ref="${IMAGE_REGISTRY}:v${VERSION}"
+    if [[ "$PULL_POLICY" != "never" ]] && pull_image "$registry_ref"; then
+        docker tag "$registry_ref" "$IMAGE_LOCAL"
+        say_ok "Updated to ${registry_ref}"
+    elif can_build_locally; then
+        say_dim "Registry unavailable — rebuilding locally"
+        build_image --pull
+    else
+        die "Could not pull ${registry_ref} and no Dockerfile to build from"
+    fi
+    echo ""
+}
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │ Current Directory Detection                                             │
 # └─────────────────────────────────────────────────────────────────────────┘
 
 detect_current_repo() {
-    if ! git rev-parse --git-dir &>/dev/null; then
-        return
-    fi
+    git rev-parse --git-dir &>/dev/null || return 0
 
     local repo_root
-    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || return)
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
 
-    local remote_url
+    local remote_url display_name
     remote_url=$(git remote get-url origin 2>/dev/null || echo "")
 
-    # Extract display name (owner/repo if remote exists, else just dirname)
-    local display_name
     if [[ -n "$remote_url" ]]; then
         if [[ "$remote_url" == git@* ]]; then
             display_name=$(echo "$remote_url" | sed 's/.*://' | sed 's/\.git$//')
@@ -1272,28 +1566,13 @@ detect_current_repo() {
         LOCAL_PATH="$repo_root"
         SELECTED_REPO=$(basename "$repo_root")
         EXTRA_PATHS=()
-
-        # Offer to mount additional directories
-        while true; do
-            echo ""
-            if ! gum confirm "Mount additional directories?"; then
-                break
-            fi
-
-            local extra_input
-            extra_input=$(gum input --placeholder="Path to another git repo...")
-
-            if [[ -z "$extra_input" ]]; then
-                break
-            fi
-
-            validate_and_add_extra_path "$extra_input" || sleep 1
-        done
+        load_config_file "$LOCAL_PATH/$REPO_CONFIG_FILE"
+        prompt_extra_mounts
     fi
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
-# │ Dependencies Check                                                      │
+# │ Dependencies                                                            │
 # └─────────────────────────────────────────────────────────────────────────┘
 
 check_deps() {
@@ -1305,10 +1584,9 @@ check_deps() {
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         clear
-        echo ""
         draw_logo
         echo ""
-        echo -e "  ${C_ERROR}${CROSS}${NC} ${C_TEXT}Missing dependencies:${NC}"
+        say_err "${C_TEXT}Missing dependencies:${NC}"
         echo ""
         for dep in "${missing[@]}"; do
             echo -e "    ${C_DIM}•${NC} ${dep}"
@@ -1321,66 +1599,167 @@ check_deps() {
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Help                                                                    │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+show_help() {
+    cat <<EOF
+
+$(draw_mini_logo)
+
+${C_TEXT}${BOLD}USAGE${NC}
+  ${C_TEXT}claude-sandbox${NC}                     ${C_DIM}Interactive mode${NC}
+  ${C_TEXT}claude-sandbox${NC} <target> [opts]     ${C_DIM}Launch directly${NC}
+  ${C_TEXT}claude-sandbox${NC} <command> [args]    ${C_DIM}Manage sandboxes${NC}
+
+${C_TEXT}${BOLD}TARGETS${NC}
+  ${C_ACCENT}.${NC}                         ${C_DIM}Current directory (local mode)${NC}
+  ${C_ACCENT}~/path/to/repo${NC}            ${C_DIM}Any local git repo${NC}
+  ${C_ACCENT}owner/repo${NC}                ${C_DIM}Clone from GitHub${NC}
+  ${C_ACCENT}git@github.com:o/r.git${NC}    ${C_DIM}Clone from a URL${NC}
+
+${C_TEXT}${BOLD}COMMANDS${NC}
+  ${C_ACCENT}run${NC} <target>              ${C_DIM}Launch a sandbox (default command)${NC}
+  ${C_ACCENT}ps${NC}                        ${C_DIM}List running sandboxes and their mounts${NC}
+  ${C_ACCENT}attach${NC} [name]             ${C_DIM}Open a second shell in a sandbox${NC}
+  ${C_ACCENT}kill${NC} [name|--all]         ${C_DIM}Stop sandboxes${NC}
+  ${C_ACCENT}orphans${NC}                   ${C_DIM}Find sandboxes whose terminal is gone${NC}
+  ${C_ACCENT}doctor${NC}                    ${C_DIM}Check host setup${NC}
+  ${C_ACCENT}update${NC}                    ${C_DIM}Pull or rebuild the sandbox image${NC}
+  ${C_ACCENT}version${NC}                   ${C_DIM}Print version${NC}
+  ${C_ACCENT}help${NC}                      ${C_DIM}Show this help${NC}
+
+${C_TEXT}${BOLD}LAUNCH OPTIONS${NC}
+  ${C_ACCENT}-y, --yes${NC}                 ${C_DIM}Skip all prompts, use defaults${NC}
+  ${C_ACCENT}-b, --branch${NC} <name>       ${C_DIM}Check out/create branch in the sandbox${NC}
+  ${C_ACCENT}-m, --mount${NC} <path>        ${C_DIM}Mount an extra local repo (repeatable)${NC}
+  ${C_ACCENT}-n, --name${NC} <name>         ${C_DIM}Container name (default: cs-<repo>)${NC}
+  ${C_ACCENT}    --auto-git${NC}            ${C_DIM}Auto-commit every N seconds (off by default)${NC}
+  ${C_ACCENT}    --no-auto-git${NC}         ${C_DIM}Disable auto-commit${NC}
+  ${C_ACCENT}    --interval${NC} <secs>     ${C_DIM}Auto-commit interval (default 60)${NC}
+  ${C_ACCENT}    --browser${NC}             ${C_DIM}Enable headless Chromium + Playwright MCP${NC}
+  ${C_ACCENT}    --update-tools${NC}        ${C_DIM}Update Claude Code and Codex on start${NC}
+  ${C_ACCENT}    --network${NC} <mode>      ${C_DIM}host (default) or bridge${NC}
+  ${C_ACCENT}-p, --publish${NC} <a:b>       ${C_DIM}Publish a port (implies bridge)${NC}
+  ${C_ACCENT}    --image${NC} <ref>         ${C_DIM}Use a specific image${NC}
+  ${C_ACCENT}    --pull${NC} / ${C_ACCENT}--no-pull${NC}     ${C_DIM}Force or skip the registry pull${NC}
+  ${C_ACCENT}    --dry-run${NC}             ${C_DIM}Print the docker command and exit${NC}
+
+${C_TEXT}${BOLD}CONFIG${NC}
+  ${C_DIM}Global:${NC}  ${CONFIG_FILE}
+  ${C_DIM}Per-repo:${NC} ./${REPO_CONFIG_FILE}  ${C_DIM}(KEY=value; parsed, never sourced)${NC}
+  ${C_DIM}Keys:${NC}    ${CONFIG_KEYS}
+
+${C_TEXT}${BOLD}EXAMPLES${NC}
+  ${C_DIM}cs .                              ${NC}${C_DIM}# sandbox the current repo${NC}
+  ${C_DIM}cs . -y --browser                 ${NC}${C_DIM}# no prompts, with a browser${NC}
+  ${C_DIM}cs . -m ~/work/api -m ~/work/web  ${NC}${C_DIM}# multi-repo session${NC}
+  ${C_DIM}cs owner/repo -b feature/login    ${NC}${C_DIM}# clone and start on a branch${NC}
+  ${C_DIM}cs . --dry-run                    ${NC}${C_DIM}# see the exact docker command${NC}
+
+EOF
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Argument Parsing                                                        │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+POSITIONAL=()
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes)        ASSUME_YES=true; shift ;;
+            -b|--branch)     SANDBOX_BRANCH="${2:?--branch needs a value}"; shift 2 ;;
+            -m|--mount)      POSITIONAL+=("${2:?--mount needs a path}"); shift 2 ;;
+            -n|--name)       CONTAINER_NAME="${2:?--name needs a value}"; shift 2 ;;
+            --auto-git)      AUTO_GIT=true; shift ;;
+            --no-auto-git)   AUTO_GIT=false; shift ;;
+            --interval)      AUTO_GIT_INTERVAL="${2:?--interval needs a value}"; shift 2 ;;
+            --browser)       BROWSER=true; shift ;;
+            --no-browser)    BROWSER=false; shift ;;
+            --update-tools)  UPDATE_TOOLS=true; shift ;;
+            --network)       NETWORK="${2:?--network needs a value}"; shift 2 ;;
+            -p|--publish)    PUBLISH_PORTS+=("${2:?--publish needs a value}"); NETWORK="bridge"; shift 2 ;;
+            --image)         IMAGE_REF="${2:?--image needs a value}"; shift 2 ;;
+            --pull)          PULL_POLICY="always"; shift ;;
+            --no-pull)       PULL_POLICY="never"; shift ;;
+            --dry-run)       DRY_RUN=true; ASSUME_YES=true; shift ;;
+            -h|--help)       show_help; exit 0 ;;
+            -v|--version)    echo "claude-sandbox ${VERSION}"; exit 0 ;;
+            --)              shift; POSITIONAL+=("$@"); break ;;
+            -*)              die "Unknown option: $1  (try: claude-sandbox --help)" ;;
+            *)               POSITIONAL+=("$1"); shift ;;
+        esac
+    done
+}
+
+# Set up SELECTED_REPO / LOCAL_MODE from a target argument
+resolve_target() {
+    local input="$1"
+
+    if [[ "$input" == "." || "$input" == ".." || "$input" == /* || "$input" == ~* || -d "$input" ]]; then
+        LOCAL_MODE=true
+        input="${input/#\~/$HOME}"
+        LOCAL_PATH=$(cd "$input" 2>/dev/null && pwd) || die "Directory not found: ${input}"
+        [[ -e "$LOCAL_PATH/.git" ]] || die "Not a git repository: ${LOCAL_PATH}"
+
+        SELECTED_REPO=$(basename "$LOCAL_PATH")
+        load_config_file "$LOCAL_PATH/$REPO_CONFIG_FILE"
+        [[ "$DRY_RUN" == true ]] || say_ok "Local repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
+        return 0
+    fi
+
+    LOCAL_MODE=false
+    if [[ "$input" == http* || "$input" == git@* ]]; then
+        SELECTED_REPO_URL="$input"
+        SELECTED_REPO=$(basename "$input" .git)
+    else
+        SELECTED_REPO_URL=$(gh repo view "$input" --json sshUrl --jq '.sshUrl' 2>/dev/null || echo "")
+        SELECTED_REPO="$input"
+        [[ -n "$SELECTED_REPO_URL" ]] || die "Repository not found: ${input}"
+    fi
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
 # │ Entry Point                                                             │
 # └─────────────────────────────────────────────────────────────────────────┘
 
 main() {
-    # Direct invocation with args
+    load_config_file "$CONFIG_FILE"
+
+    # Dispatch management subcommands before generic parsing
+    case "${1:-}" in
+        ps)      shift; check_deps; cmd_ps "$@"; exit 0 ;;
+        attach)  shift; check_deps; cmd_attach "${1:-}"; exit 0 ;;
+        kill)    shift; check_deps; parse_args "$@"; cmd_kill "${POSITIONAL[0]:-${1:-}}"; exit 0 ;;
+        orphans) shift; check_deps; cmd_orphans; exit 0 ;;
+        doctor)  shift; cmd_doctor; exit 0 ;;
+        update)  shift; check_deps; parse_args "$@"; cmd_update; exit 0 ;;
+        version) echo "claude-sandbox ${VERSION}"; exit 0 ;;
+        help)    show_help; exit 0 ;;
+        run)     shift ;;
+    esac
+
+    parse_args "$@"
+    set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+
+    check_deps
+
+    # Direct invocation with a target
     if [[ $# -gt 0 ]]; then
-        check_deps
+        resolve_target "$1"
+        shift
 
-        local input="$1"
+        EXTRA_PATHS=()
+        for extra_arg in "$@"; do
+            validate_and_add_extra_path "$extra_arg" \
+                || say_err "Skipping invalid extra path: ${extra_arg}"
+        done
 
-        # Check if it's a local path (starts with . / ~ or is an existing directory)
-        if [[ "$input" == "." || "$input" == ".." || "$input" == /* || "$input" == ~* || -d "$input" ]]; then
-            # Local mode
-            LOCAL_MODE=true
-
-            # Expand ~ and resolve to absolute path
-            input="${input/#\~/$HOME}"
-            LOCAL_PATH=$(cd "$input" 2>/dev/null && pwd) || {
-                echo -e "  ${C_ERROR}${CROSS}${NC} Directory not found: ${input}"
-                exit 1
-            }
-
-            # Check if it's a git repo
-            if [[ ! -d "$LOCAL_PATH/.git" ]]; then
-                echo -e "  ${C_ERROR}${CROSS}${NC} Not a git repository: ${LOCAL_PATH}"
-                exit 1
-            fi
-
-            SELECTED_REPO=$(basename "$LOCAL_PATH")
-            echo -e "  ${C_SUCCESS}${CHECK}${NC} Local repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
-
-            # Process remaining args as extra mounts
-            shift
-            EXTRA_PATHS=()
-            for extra_arg in "$@"; do
-                validate_and_add_extra_path "$extra_arg" || {
-                    echo -e "  ${C_ERROR}${CROSS}${NC} Skipping invalid extra path: ${extra_arg}"
-                }
-            done
-
-            if screen_launch_confirm; then
-                launch_sandbox
-            fi
+        if [[ "$DRY_RUN" == true ]]; then
+            launch_sandbox
             exit 0
-        fi
-
-        # GitHub mode
-        refresh_gh_user
-
-        if [[ "$input" == http* || "$input" == git@* ]]; then
-            SELECTED_REPO_URL="$input"
-            SELECTED_REPO=$(basename "$input" .git)
-        else
-            SELECTED_REPO_URL=$(gh repo view "$input" --json sshUrl --jq '.sshUrl' 2>/dev/null || echo "")
-            SELECTED_REPO="$input"
-
-            if [[ -z "$SELECTED_REPO_URL" ]]; then
-                echo -e "  ${C_ERROR}${CROSS}${NC} Repository not found: ${input}"
-                exit 1
-            fi
         fi
 
         if screen_launch_confirm; then
@@ -1390,11 +1769,9 @@ main() {
     fi
 
     # Interactive mode
-    check_deps
     screen_welcome
     detect_current_repo
 
-    # If no repo detected from current dir, show source selection
     if [[ -z "$SELECTED_REPO" ]]; then
         screen_source_select
     fi
@@ -1402,4 +1779,8 @@ main() {
     screen_main_menu
 }
 
-main "$@"
+# Only run when executed, so tests can source this file
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    trap cleanup_terminal EXIT INT TERM
+    main "$@"
+fi

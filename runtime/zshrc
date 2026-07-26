@@ -1,0 +1,29 @@
+# Claude Sandbox — container shell config.
+# Appended to the oh-my-zsh .zshrc at image build time.
+
+[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
+
+# ── Agents ───────────────────────────────────────────────────────────────────
+# The container *is* the security boundary, so both agents run unrestricted
+# inside it. Nothing here weakens the host.
+alias claude="claude --dangerously-skip-permissions"
+alias c="claude --dangerously-skip-permissions"
+
+alias codex="command codex --dangerously-bypass-approvals-and-sandbox"
+alias x="command codex --dangerously-bypass-approvals-and-sandbox"
+
+# ── Python ───────────────────────────────────────────────────────────────────
+# /opt/venv is first on PATH, so pip/python/uv all target the venv. No
+# --break-system-packages needed; the system interpreter stays untouched.
+export VIRTUAL_ENV=/opt/venv
+
+# ── Quality of life ──────────────────────────────────────────────────────────
+alias ll='ls -lah'
+alias gs='git status --short --branch'
+alias gl='git log --oneline -20'
+
+# Tail the auto-save daemon
+alias autogit-log='tail -f /tmp/auto-git.log'
+
+# Show sandbox banner again
+alias sandbox-info='cat /usr/local/share/sandbox-context.md'
