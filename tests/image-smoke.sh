@@ -28,6 +28,13 @@ check() {
     fi
 }
 
+# GNU stat needs -c, BSD stat needs -f — and GNU's -f prints filesystem info to
+# STDOUT while exiting 1, so a `-f || -c` fallback silently returns that noise
+# with the real answer appended. Try the GNU form first: it fails cleanly on BSD.
+file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
 in_image() {
     docker run --rm --entrypoint bash "$IMAGE" -c "$1" 2>&1
 }
@@ -85,14 +92,14 @@ mkdir -p "$workdir/repo/.git"
 echo "secret" > "$workdir/repo/.env"
 chmod 600 "$workdir/repo/.env"
 
-before="$(stat -f '%Lp' "$workdir/repo/.env" 2>/dev/null || stat -c '%a' "$workdir/repo/.env")"
+before="$(file_mode "$workdir/repo/.env")"
 docker run --rm -v "$workdir/repo:/home/node/workspace/repo" --entrypoint bash "$IMAGE" -c '
     sudo chmod 777 /home/node/workspace 2>/dev/null || true
     sudo chmod 1777 /tmp 2>/dev/null || true
-    touch /home/node/workspace/CLAUDE.md
-    touch /home/node/workspace/repo/.probe && rm /home/node/workspace/repo/.probe
-' >/dev/null 2>&1
-after="$(stat -f '%Lp' "$workdir/repo/.env" 2>/dev/null || stat -c '%a' "$workdir/repo/.env")"
+    touch /home/node/workspace/CLAUDE.md 2>/dev/null || true
+    touch /home/node/workspace/repo/.probe 2>/dev/null && rm /home/node/workspace/repo/.probe || true
+' >/dev/null 2>&1 || true
+after="$(file_mode "$workdir/repo/.env")"
 
 if [[ "$before" == "$after" ]]; then
     ok "host file permissions preserved (.env stayed $after)"
@@ -224,7 +231,7 @@ rm -rf "$ctx2"
 # An early version wrote into the repo and polluted user projects.
 ownmd="$(mktemp -d)"; mkdir -p "$ownmd/repo"
 printf '# project rules\n' > "$ownmd/repo/CLAUDE.md"
-before_md5=$(md5 -q "$ownmd/repo/CLAUDE.md" 2>/dev/null || md5sum "$ownmd/repo/CLAUDE.md" | cut -d" " -f1)
+before_md5=$(md5sum "$ownmd/repo/CLAUDE.md" 2>/dev/null | cut -d" " -f1 || md5 -q "$ownmd/repo/CLAUDE.md")
 
 docker run --rm -e "LOCAL_MODE=1" -e "DISABLE_AUTO_GIT=1" \
     -v "$ownmd/repo:/home/node/workspace/repo" --entrypoint bash "$IMAGE" -c '
@@ -234,7 +241,7 @@ docker run --rm -e "LOCAL_MODE=1" -e "DISABLE_AUTO_GIT=1" \
         cat /usr/local/share/sandbox-context.md >> ~/workspace/CLAUDE.md
         test -f ~/workspace/repo/CLAUDE.md' >/dev/null 2>&1
 
-after_md5=$(md5 -q "$ownmd/repo/CLAUDE.md" 2>/dev/null || md5sum "$ownmd/repo/CLAUDE.md" | cut -d" " -f1)
+after_md5=$(md5sum "$ownmd/repo/CLAUDE.md" 2>/dev/null | cut -d" " -f1 || md5 -q "$ownmd/repo/CLAUDE.md")
 if [[ "$before_md5" == "$after_md5" ]]; then
     ok "a repo's own CLAUDE.md is left byte-identical"
 else
