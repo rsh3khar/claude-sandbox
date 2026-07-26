@@ -28,6 +28,13 @@ readonly SCRIPT_DIR
 # Ensure terminal is restored on exit. The trap is installed only when this
 # file is executed, not sourced — an EXIT trap set at source time would
 # clobber the caller's own (bats, for one, reports results from its EXIT trap).
+# `clear` fails when TERM is unset, dumb, or output is not a terminal. A screen
+# must never abort because of that, and under `set -euo pipefail` a bare `clear`
+# would do exactly that.
+clear_screen() {
+    clear 2>/dev/null || true
+}
+
 cleanup_terminal() {
     # Only emit terminal control sequences to a real terminal. When stdout is a
     # pipe — `cs exec ... > file`, `cs . --dry-run | grep` — these would end up
@@ -92,6 +99,8 @@ EXEC_PROMPT=""                     # non-empty => headless one-shot run
 AGENT="${CS_AGENT:-claude}"
 SNAPSHOT="${CS_SNAPSHOT:-false}"   # opt-in: record the working tree before launching
 MOUNTS=""                          # set by config files, consumed on load
+REPO_ROOTS="${CS_REPO_ROOTS:-}"     # extra dirs to search for mountable repos
+REPO_DEPTH="${CS_REPO_DEPTH:-5}"    # how deep to look; ~/work/<a>/<b>/<repo> needs 4+
 
 # Gum styling via environment variables (amber theme)
 export GUM_CHOOSE_CURSOR="▸ "
@@ -244,12 +253,87 @@ animate_spinner() {
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
+# │ Interactive Prompts                                                     │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# Every picker goes through these three functions.
+#
+# gum exits non-zero when the user presses esc or ctrl-c. Under `set -euo
+# pipefail`, an unguarded `choice=$(gum choose ...)` therefore aborts the whole
+# CLI — pressing esc used to quit cs outright, with no message. Normalising
+# that to "empty output, exit 0" belongs in one place rather than at every
+# call site, where the next one added would forget it.
+
+# Single choice from a list. Uses fzf when available purely so that ← can mean
+# "back": gum choose exposes no key bindings, and its stock footer advertises
+# "←↓↑→ navigate" while left/right in fact do nothing in a one-column list.
+# Either backend returns empty when cancelled.
+pick_one() {
+    local header="$1"
+    shift
+    [[ $# -gt 0 ]] || return 0
+
+    local height=$(( $# + 2 ))
+    [[ $height -gt 14 ]] && height=14
+
+    if command -v fzf &>/dev/null; then
+        local args=(
+            --no-multi
+            --height="$((height + 2))"
+            --layout=reverse
+            --border
+            --info=hidden
+            --pointer='▸'
+            '--color=fg+:214,pointer:214,border:240,header:240,prompt:214'
+            --prompt='  '
+            --bind=left:abort
+        )
+        [[ -n "$header" ]] && args+=(--header="$header")
+        printf '%s\n' "$@" | fzf "${args[@]}" || true
+        return
+    fi
+
+    if [[ -n "$header" ]]; then
+        printf '%s\n' "$@" | gum choose --header="$header" --height="$height" || true
+    else
+        printf '%s\n' "$@" | gum choose --height="$height" || true
+    fi
+}
+
+pick_many() {
+    local placeholder="$1"
+    shift
+    [[ $# -gt 0 ]] || return 0
+
+    # gum, not fzf: --placeholder and --header are gum options, and fzf has no
+    # --width so it would claim the whole terminal beside the 56-column panels.
+    printf '%s\n' "$@" | gum filter \
+        --no-limit \
+        --height=14 \
+        --header="tab to select several · enter to confirm · esc to go back" \
+        --placeholder="$placeholder" || true
+}
+
+# Single-select fuzzy filter over items on stdin (large lists: repo names)
+pick_filter() {
+    gum filter --placeholder="$1" --height=14 || true
+}
+
+ask_text() {
+    if [[ -n "${2:-}" ]]; then
+        gum input --placeholder="$1" --value="$2" || true
+    else
+        gum input --placeholder="$1" || true
+    fi
+}
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
 # │ Configuration                                                           │
 # └─────────────────────────────────────────────────────────────────────────┘
 
 # Config files are parsed, never sourced: `cs .` in an untrusted repo must not
 # be able to execute code on the host.
-readonly CONFIG_KEYS="AUTO_GIT AUTO_GIT_INTERVAL BROWSER UPDATE_TOOLS NETWORK PULL_POLICY IMAGE_REF WORKTREE AGENT MOUNTS SNAPSHOT"
+readonly CONFIG_KEYS="AUTO_GIT AUTO_GIT_INTERVAL BROWSER UPDATE_TOOLS NETWORK PULL_POLICY IMAGE_REF WORKTREE AGENT MOUNTS SNAPSHOT REPO_ROOTS REPO_DEPTH"
 
 # Options set explicitly on the command line always beat config files, which
 # are loaded later (a repo's .claude-sandbox is only found after the target is
@@ -456,9 +540,147 @@ git_root_of() {
     git -C "$1" rev-parse --show-toplevel 2>/dev/null
 }
 
+# A compact, one-line description of what the session will mount. Shown inside
+# the pickers themselves, because the folder browser covers most of the screen
+# and otherwise you are choosing the fourth folder with no reminder of the
+# first three.
+mounts_summary() {
+    local primary="" parts=() ep name
+    [[ -n "${SELECTED_REPO:-}" ]] && primary="$(basename "$SELECTED_REPO")"
+
+    for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+        name="$(mount_name "$ep")"
+        [[ "$(mount_mode "$ep")" == "ro" ]] && name="${name}:ro"
+        parts+=("$name")
+    done
+
+    if [[ ${#parts[@]} -eq 0 ]]; then
+        printf 'mounting: %s' "${primary:-nothing yet}"
+        return 0
+    fi
+
+    local joined
+    joined=$(printf '%s, ' "${parts[@]}")
+    joined="${joined%, }"
+    printf 'mounting: %s + %s' "${primary:-?}" "$joined"
+}
+
+# Terminal width, overridable so the layout can be tested at fixed sizes.
+term_cols() {
+    echo "${CS_TERM_COLS:-$(tput cols 2>/dev/null || echo 80)}"
+}
+term_rows() {
+    echo "${CS_TERM_ROWS:-$(tput lines 2>/dev/null || echo 24)}"
+}
+
+# Park the selection panel in the top-right corner, out of the way of the main
+# column, and leave the cursor where the caller left it so the rest of the
+# screen draws normally.
+#
+# Only when there is genuinely room: absolute positioning in a line-oriented CLI
+# collides with anything that scrolls, and a mangled overlay is worse than a
+# stacked panel. Below the threshold it falls back to stacking, which cannot
+# break.
+readonly SIDE_PANEL_WIDTH=46
+readonly MAIN_COLUMN_WIDTH=56
+
+selection_fits_beside() {
+    local cols rows
+    cols=$(term_cols)
+    rows=$(term_rows)
+    [[ "$cols" -ge $((MAIN_COLUMN_WIDTH + SIDE_PANEL_WIDTH + 4)) && "$rows" -ge 24 ]]
+}
+
+draw_selection_corner() {
+    if ! selection_fits_beside; then
+        draw_selection_panel
+        echo ""
+        return 0
+    fi
+
+    local cols col row=0 line
+    cols=$(term_cols)
+    col=$((cols - SIDE_PANEL_WIDTH - 1))
+
+    # Snapshot the cursor, paint the panel top-right, then restore it.
+    tput sc 2>/dev/null || true
+    while IFS= read -r line; do
+        tput cup "$row" "$col" 2>/dev/null || true
+        printf '%s' "$line"
+        row=$((row + 1))
+    done < <(draw_selection_panel "$SIDE_PANEL_WIDTH")
+    tput rc 2>/dev/null || true
+}
+
+# The single place that shows everything this sandbox will mount. Redrawn after
+# each clear so it is always on screen during selection, rather than printed
+# once and scrolled away by the next picker.
+draw_selection_panel() {
+    local w="${1:-56}" ep name mode_note path_note
+
+    draw_box $w "THIS SANDBOX WILL MOUNT"
+    draw_spacer $w
+
+    if [[ -n "${SELECTED_REPO:-}" ]]; then
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_BRIGHT}$(basename "$SELECTED_REPO")${NC} ${C_DIM}(main)${NC}"
+        if [[ "$LOCAL_MODE" == true && -n "${LOCAL_PATH:-}" ]]; then
+            local main_path
+            main_path="$(display_path "$LOCAL_PATH")"
+            if [[ ${#main_path} -gt $((w - 10)) ]]; then
+                main_path="…${main_path: -$((w - 11))}"
+            fi
+            draw_box_row $w "      ${C_DIM}${main_path}${NC}"
+        fi
+    else
+        draw_box_row $w "  ${C_DIM}${RING} no folder chosen yet${NC}"
+    fi
+
+    for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+        name="$(mount_name "$ep")"
+        mode_note=""
+        [[ "$(mount_mode "$ep")" == "ro" ]] && mode_note=" ${C_WARN}[read-only]${NC}"
+        path_note="$(display_path "$(mount_path "$ep")")"
+        if [[ ${#path_note} -gt $((w - 10)) ]]; then
+            path_note="…${path_note: -$((w - 11))}"
+        fi
+        draw_box_row $w "  ${C_SUCCESS}${CHECK}${NC} ${C_TEXT}${name}${NC}${mode_note}"
+        draw_box_row $w "      ${C_DIM}${path_note}${NC}"
+    done
+
+    draw_spacer $w
+    draw_box_bottom $w
+}
+
+# Shorten a path for display, and turn a displayed path back into a real one.
+# These exist as a pair because `${p/#$HOME/\~}` leaves a *literal backslash*
+# on bash 3.2 — which is what /bin/bash still is on macOS — while behaving
+# correctly on bash 5. The round trip therefore broke on the platform most
+# users are on, turning every path into "\~/work/app". Escaping in a pattern
+# is fine; escaping in a replacement is not, so neither is used here.
+display_path() {
+    if [[ "$1" == "$HOME"/* ]]; then
+        printf '~%s' "${1#"$HOME"}"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+resolve_display_path() {
+    # The tilde here is a display token to match, not a path to expand.
+    # shellcheck disable=SC2088
+    if [[ "$1" == "~" ]]; then
+        printf '%s' "$HOME"
+    elif [[ "$1" == "~/"* ]]; then
+        printf '%s%s' "$HOME" "${1:1}"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # Expand ~, resolve to an absolute path
 abs_path_of() {
-    local p="${1/#\~/$HOME}"
+    local p
+    p="$(resolve_display_path "$1")"
     (cd "$p" 2>/dev/null && pwd)
 }
 
@@ -965,7 +1187,7 @@ pick_container() {
         echo "${names[0]}"
         return 0
     fi
-    printf '%s\n' "${names[@]}" | gum choose --header "$prompt" --height=10
+    pick_one "$prompt" "${names[@]}"
 }
 
 resolve_container() {
@@ -999,44 +1221,55 @@ resolve_container() {
         echo "${matches[0]}"
         return 0
     fi
-    printf '%s\n' "${matches[@]}" | gum choose --header "'${target}' matches multiple — pick one" --height=10
+    pick_one "'${target}' matches multiple — pick one" "${matches[@]}"
 }
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │ Screens                                                                 │
 # └─────────────────────────────────────────────────────────────────────────┘
 
-screen_welcome() {
-    clear
-    draw_logo
-
-    refresh_gh_user
-
-    # GitHub is optional: plenty of sessions are purely local folders.
-    if [[ -z "$GH_USER" ]]; then
+# Standard screen prologue: clear, then a compact identity line.
+#
+# The first screen after startup is the exception — it keeps the full logo that
+# screen_welcome just drew, instead of wiping it a few milliseconds later.
+FIRST_SCREEN=true
+screen_header() {
+    if [[ "$FIRST_SCREEN" == true ]]; then
+        FIRST_SCREEN=false
         echo ""
-        say_warn "${C_TEXT}No GitHub account connected${NC}"
-        echo -e "     ${C_DIM}Local repos work fine. Run ${C_TEXT}gh auth login${C_DIM} to clone from GitHub.${NC}"
-        echo ""
-        echo -e "  ${C_DIM}Press ${C_TEXT}Enter${C_DIM} to continue...${NC}"
-        read -r
         return 0
     fi
-
-    draw_user_card "$GH_USER"
-
+    clear_screen
     echo ""
-    echo -e "  ${C_DIM}Press ${C_TEXT}Enter${C_DIM} to continue...${NC}"
-    read -r
+    draw_mini_logo
+    echo ""
+}
+
+# The logo, and nothing else.
+#
+# This used to fetch the GitHub identity and render a contribution graph, then
+# wait for Enter — roughly 1.3s of blocking network plus a keypress, on every
+# single launch, gating nothing. A local session never needs GitHub at all, so
+# the identity is fetched lazily at the point it is actually used (repo
+# selection, account switching, doctor) and the profile card is shown there,
+# where it informs a decision instead of decorating a splash screen.
+screen_welcome() {
+    clear_screen
+    draw_logo
+}
+
+# Fetch the GitHub identity once, on demand.
+ensure_gh_user() {
+    [[ -n "$GH_USER" ]] && return 0
+    [[ "${GH_LOOKUP_DONE:-}" == true ]] && return 0
+    GH_LOOKUP_DONE=true
+    refresh_gh_user
 }
 
 screen_source_select() {
     local w=56
 
-    clear
-    echo ""
-    draw_mini_logo
-    echo ""
+    screen_header
 
     draw_box $w "SELECT SOURCE"
     draw_spacer $w
@@ -1055,25 +1288,23 @@ screen_source_select() {
     local recents
     recents=$(list_recent_workspaces)
     [[ -n "$recents" ]] && options+=("Recent workspace")
-    options+=("Local directory" "GitHub repository")
+    options+=("Local directory" "GitHub repository" "← Back")
 
     local choice
-    choice=$(printf '%s\n' "${options[@]}" | gum choose --height=5)
+    choice=$(pick_one "" "${options[@]}")
 
     case "$choice" in
         "Recent workspace")  screen_recent_workspaces ;;
         "Local directory")   LOCAL_MODE=true; screen_local_path ;;
-        "GitHub repository") LOCAL_MODE=false ;;
+        "GitHub repository") LOCAL_MODE=false; ensure_gh_user ;;
+        *)                   return 0 ;;   # Back / cancelled -> main menu
     esac
 }
 
 screen_recent_workspaces() {
     local w=56
 
-    clear
-    echo ""
-    draw_mini_logo
-    echo ""
+    screen_header
 
     draw_box $w "RECENT WORKSPACES"
     draw_spacer $w
@@ -1100,8 +1331,8 @@ screen_recent_workspaces() {
     fi
 
     local choice
-    choice=$(printf '%s\n' "${labels[@]}" | gum choose --height=12)
-    [[ -z "$choice" ]] && return
+    choice=$(pick_one "" "${labels[@]}" "← Back")
+    [[ -z "$choice" || "$choice" == "← Back" ]] && return
 
     local i
     for i in "${!labels[@]}"; do
@@ -1115,88 +1346,400 @@ screen_recent_workspaces() {
     done
 }
 
-# Mounting several sibling repos is the common case, so offer them as a
-# multi-select instead of making you type each path.
-offer_sibling_mounts() {
-    local parent
-    parent=$(dirname "$LOCAL_PATH")
-    [[ -d "$parent" ]] || return 0
+# Find git repos worth offering as mounts. Repos are rarely all in one folder,
+# so this searches the primary repo's parent AND grandparent, plus anything in
+# REPO_ROOTS.
+#
+# Depth matters more than it looks: ~/work/<group>/<repo> puts .git 3 levels
+# down, but ~/work/<group>/<area>/<repo> puts it 4 down, and anything shallower
+# silently omits those repos. Measured on a real tree: depth 3 found 29 repos
+# in 12ms, depth 4 found 46, depth 5 found 47 in 59ms, depth 6 found nothing
+# more. 5 is the point where it stops missing things and still feels instant.
+discover_repos() {
+    local base="${1:-${LOCAL_PATH:-$PWD}}"
+    local roots=() parent grandparent r resolved
 
-    local siblings=() dir
+    parent=$(dirname "$base")
+    grandparent=$(dirname "$parent")
+    [[ "$parent" != "$HOME" && "$parent" != "/" ]] && roots+=("$parent")
+    [[ "$grandparent" != "$HOME" && "$grandparent" != "/" && "$grandparent" != "$parent" ]] && roots+=("$grandparent")
+
+    if [[ -n "${REPO_ROOTS:-}" ]]; then
+        local IFS_SAVE="$IFS"
+        IFS=','
+        for r in $REPO_ROOTS; do
+            IFS="$IFS_SAVE"
+            r="${r#"${r%%[![:space:]]*}"}"
+            r="${r%"${r##*[![:space:]]}"}"
+            resolved=$(abs_path_of "$r") && roots+=("$resolved")
+            IFS=','
+        done
+        IFS="$IFS_SAVE"
+    fi
+
+    [[ ${#roots[@]} -gt 0 ]] || return 0
+
+    find "${roots[@]}" -maxdepth "${REPO_DEPTH:-5}" -name .git -not -path "*/node_modules/*" 2>/dev/null \
+        | sed 's|/\.git$||' \
+        | sort -u
+}
+
+# Offer every discovered repo as a fuzzy-filterable multi-select, so mounting
+# folders from different trees is typing a few letters rather than full paths.
+offer_repo_mounts() {
+    local candidates=() dir already ep
     while IFS= read -r dir; do
-        [[ -n "$dir" ]] || continue
-        [[ "$dir" == "$LOCAL_PATH" ]] && continue
-        [[ -e "$dir/.git" ]] || continue
+        [[ -n "$dir" && -d "$dir" ]] || continue
+        [[ -n "${LOCAL_PATH:-}" && "$dir" == "$LOCAL_PATH" ]] && continue
 
-        local already=false ep
+        already=false
         for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
             [[ "$(mount_path "$ep")" == "$dir" ]] && { already=true; break; }
         done
         [[ "$already" == true ]] && continue
 
-        siblings+=("$(basename "$dir")")
-    done < <(find "$parent" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+        candidates+=("$(display_path "$dir")")
+    done < <(discover_repos)
 
-    [[ ${#siblings[@]} -gt 0 ]] || return 0
+    [[ ${#candidates[@]} -gt 0 ]] || return 0
 
     echo ""
-    echo -e "  ${C_DIM}Repos next to ${C_TEXT}$(basename "$LOCAL_PATH")${C_DIM} — space to select, enter to confirm, esc to skip${NC}"
+    echo -e "  ${C_DIM}${#candidates[@]} repos found — type to filter, ${C_TEXT}tab${C_DIM} to select several, ${C_TEXT}enter${C_DIM} to confirm${NC}"
     echo ""
 
+    # NOTE: no 2>/dev/null here. gum draws its interface on stderr so that
+    # stdout stays clean for the selection; discarding stderr renders the
+    # picker invisible while it silently waits for keystrokes.
     local picked
-    picked=$(printf '%s\n' "${siblings[@]}" | gum choose --no-limit --height=12 \
-        --header "Mount alongside $(basename "$LOCAL_PATH")?" 2>/dev/null) || return 0
+    picked=$(pick_many "Mount alongside $(basename "$LOCAL_PATH")... (esc to skip)" "${candidates[@]}")
 
     [[ -n "$picked" ]] || return 0
 
-    local name
-    while IFS= read -r name; do
-        [[ -n "$name" ]] && validate_and_add_extra_path "${parent}/${name}"
+    local sel
+    while IFS= read -r sel; do
+        [[ -n "$sel" ]] && validate_and_add_extra_path "$(resolve_display_path "$sel")"
     done <<< "$picked"
 }
 
-prompt_extra_mounts() {
-    offer_sibling_mounts
+# Directory browser with a preview pane and drill-down, in the spirit of
+# Finder's column view: the list is the current level, the right pane shows
+# what is inside the highlighted folder, → descends and ← goes back up.
+#
+# Multi-select is the point — mounting four repos should be four taps of tab,
+# not four trips through a wizard. Prints one absolute path per line.
+# Each row is "<absolute path>\tab<display>". Keeping the path in its own
+# hidden column is the whole trick: fzf's {1} is then always a clean path, and
+# the display half is free to carry markers and styling. Deriving the path back
+# out of a decorated string does not work — the [repo] marker is wrapped in
+# escape codes, so stripping it by pattern silently yields an invalid path.
+readonly BROWSE_LIST_BODY='
+    for p in "$dir"/*/; do
+        [ -d "$p" ] || continue
+        p=${p%/}
+        n=${p##*/}
+        case "$n" in .*) continue ;; esac
+        if [ -e "$p/.git" ]; then printf "%s\t%s  [repo]\n" "$p" "$n"
+        else printf "%s\t%s/\n" "$p" "$n"; fi
+    done'
+
+list_dirs_of() {
+    dir="$1" sh -c "$BROWSE_LIST_BODY"
+}
+
+# Flat, filterable, multi-select list of folders under an anchor.
+#
+# Deliberately NOT a drill-down browser. Navigation required fzf's `reload`,
+# and reload clears marks by design — which is what made selecting folders in
+# several places impossible. Every workaround for that (marks in a file driven
+# by execute-silent) depends on fzf behaviour that cannot be verified from
+# here, so this uses only --multi, fzf's oldest and most exercised feature.
+#
+# You get the whole tree at once instead: type to narrow, space or tab to mark
+# as many as you like from anywhere in the list, enter to take them all.
+browse_directories() {
+    local start="${1:-$HOME}"
+
+    if ! command -v fzf &>/dev/null; then
+        gum file --directory --height=14 "$start"
+        return
+    fi
+
+    local preview='
+        printf "\033[1m%s\033[0m\n" "${1##*/}"
+        printf "\033[38;5;240m%s\033[0m\n\n" "$1"
+        if [ -e "$1/.git" ]; then
+            printf "\033[38;5;214mgit\033[0m  %s\n\n" "$(git -C "$1" branch --show-current 2>/dev/null || echo detached)"
+        fi
+        ls -A "$1" 2>/dev/null | head -40'
+
+    fzf --multi \
+        --delimiter='\t' \
+        --with-nth=2 \
+        --height=90% \
+        --layout=reverse \
+        --border \
+        --prompt="folder> " \
+        --header="$(mounts_summary)"'
+type to filter   space/tab mark   enter add all marked   esc cancel' \
+        --bind='space:toggle+down' \
+        --preview="sh -c '$preview' _ {1}" \
+        --preview-window="right:55%:wrap" \
+        < <(list_dirs_tree "$start") \
+        | cut -f1
+}
+
+# What the picker offers, as "<path>\t<display>".
+#
+# Reach goes back as far as $HOME and no further, in one flat list — no
+# navigation keys, because navigating needs fzf's `reload` and reload clears
+# your marks, which is what made multi-select impossible in the first place.
+#
+# Three bands, most relevant first:
+#   1. repos in the tree you are working in, at any depth
+#   2. everything one and two levels under $HOME (~/knowledge, ~/code/foo)
+#   3. the current parent's own children
+#
+# Deliberately not a deep repo scan of all of $HOME: that is 131 repos in 6.2s
+# here, versus 122ms for this. Type to filter; the list is meant to be sieved,
+# not read.
+list_dirs_tree() {
+    local root="$1"
+    local repo_depth="${CS_BROWSE_DEPTH:-5}"
+    local home_depth="${CS_BROWSE_HOME_DEPTH:-2}"
+    root="${root%/}"
+
+    local p
+    # One pass, deduped by path at the end: grepping a growing file once per
+    # entry cost 710ms for 264 rows; awk does it in a single sweep.
+    emit() {
+        local path="$1" marker="$2"
+        printf '%s\t%s%s\n' "$path" "$(display_path "$path")" "$marker"
+    }
+
+    {
+
+    # 1. repos in the working tree, however deep
+    if [[ -d "$root" ]]; then
+        while IFS= read -r p; do
+            [[ -n "$p" ]] && emit "$p" "  [repo]"
+        done < <(find "$root" -mindepth 1 -maxdepth "$repo_depth" -name .git \
+                    -not -path '*/node_modules/*' 2>/dev/null \
+                 | sed 's|/\.git$||' | sort -u)
+    fi
+
+    # 2. everything shallow under $HOME — this is the "as far back as ~" part
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        if [[ -e "$p/.git" ]]; then emit "$p" "  [repo]"; else emit "$p" "/"; fi
+    done < <(find "$HOME" -mindepth 1 -maxdepth "$home_depth" -type d \
+                -not -path '*/.*' \
+                -not -name Library -not -path "$HOME/Library/*" \
+                -not -name Applications -not -path "$HOME/Applications/*" \
+                -not -name '*.app' -not -path '*.app/*' \
+                -not -name node_modules -not -path '*/node_modules/*' \
+                2>/dev/null | sort)
+
+    # 3. the current parent's own children, in case they are deeper than $HOME+2
+    if [[ -d "$root" ]]; then
+        while IFS= read -r p; do
+            [[ -n "$p" ]] || continue
+            if [[ -e "$p/.git" ]]; then emit "$p" "  [repo]"; else emit "$p" "/"; fi
+        done < <(find "$root" -mindepth 1 -maxdepth 1 -type d \
+                    -not -path '*/.*' \
+                    -not -name Library -not -name Applications \
+                    -not -name '*.app' -not -name node_modules \
+                    2>/dev/null | sort)
+    fi
+
+    } | awk -F'\t' '!seen[$1]++'
+}
+
+# Drop a mount added by mistake. Inside the picker `space` un-marks a row, but
+# once a batch is confirmed there was no way back short of restarting.
+remove_mount_interactively() {
+    [[ ${#EXTRA_PATHS[@]} -gt 0 ]] || return 0
+
+    local labels=() ep name mode
+    for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+        name="$(mount_name "$ep")"
+        mode="$(mount_mode "$ep")"
+        [[ "$mode" == "ro" ]] && name="${name}  [read-only]"
+        labels+=("$name")
+    done
+    labels+=("← Back")
+
+    local picked
+    picked=$(pick_one "Remove which mount?" "${labels[@]}")
+    [[ -n "$picked" && "$picked" != "← Back" ]] || return 0
+
+    picked="${picked%%  \[read-only\]}"
+
+    local kept=()
+    for ep in ${EXTRA_PATHS[@]+"${EXTRA_PATHS[@]}"}; do
+        if [[ "$(mount_name "$ep")" == "$picked" ]]; then
+            say_ok "Removed ${C_ACCENT}${picked}${NC}"
+            continue
+        fi
+        kept+=("$ep")
+    done
+    EXTRA_PATHS=(${kept[@]+"${kept[@]}"})
+}
+
+# mode: "rw" (default) or "ro"
+add_mount_interactively() {
+    local mode="${2:-rw}"
+    # Browsing runs in a loop, one folder per pass.
+    #
+    # fzf's reload action clears marks by design, so tab-selections cannot
+    # survive navigating to another directory — selecting three folders in
+    # three places left only the last. Rather than fight that inside fzf,
+    # accumulation happens here: mark what you want in one folder, press
+    # enter, and the browser reopens where you left off with the previous
+    # picks already added. esc ends the loop.
+    local start="${1:-$HOME}"
+    local added_any=false
 
     while true; do
+        # `|| true`, not `|| return`: a non-zero exit must not discard a
+        # selection actually made. Emptiness is the only "cancelled".
+        local picked
+        picked=$(browse_directories "$start") || true
+        [[ -n "$picked" ]] || break
+
+        local path last="" added_this_pass=false
+        while IFS= read -r path; do
+            [[ -n "$path" ]] || continue
+            last="$path"
+            if [[ "$mode" == "ro" ]]; then
+                validate_and_add_extra_path "${path}:ro" && added_this_pass=true || sleep 1
+            else
+                validate_and_add_extra_path "$path" && added_this_pass=true || sleep 1
+            fi
+        done <<< "$picked"
+
+        # A pass that adds nothing new (all duplicates) means asking again would
+        # just repeat itself. Stop rather than loop.
+        [[ "$added_this_pass" == true ]] || break
+        added_any=true
+
+        # Reopen next to the last thing picked, so continuing nearby is cheap
+        [[ -n "$last" && -d "$last" ]] && start="$(dirname "$last")"
+
         echo ""
-        gum confirm --default=false "Mount another directory (outside $(basename "$(dirname "$LOCAL_PATH")")/)?" || break
+        gum confirm --default=true "Add folders from somewhere else?" || break
+    done
 
-        local extra_input
-        extra_input=$(gum input --placeholder="~/path/to/folder   (append :ro for read-only)")
-        [[ -z "$extra_input" ]] && break
+    [[ "$added_any" == true ]]
+    return 0
+}
 
-        validate_and_add_extra_path "$extra_input" || sleep 1
+# A loop rather than a one-shot, so folders can be added a few at a time from
+# different sources — and so there's a way back out of each one.
+prompt_extra_mounts() {
+    local choice count
+
+    while true; do
+        count=${#EXTRA_PATHS[@]}
+
+        screen_header
+        draw_selection_corner
+
+        local menu=("Pick from my repos" "Browse folders" "Browse folders (read-only)" "Type a path")
+        [[ ${#EXTRA_PATHS[@]} -gt 0 ]] && menu+=("Remove a mount")
+        menu+=("Done")
+
+        choice=$(pick_one "$(mounts_summary)   ·   esc when done" "${menu[@]}")
+
+        case "$choice" in
+            "Pick from my repos")  offer_repo_mounts ;;
+            "Browse folders")      add_mount_interactively "$(dirname "$LOCAL_PATH")" rw ;;
+            "Browse folders (read-only)")
+                                   add_mount_interactively "$(dirname "$LOCAL_PATH")" ro ;;
+            "Remove a mount")      remove_mount_interactively ;;
+            "Type a path")
+                local extra_input
+                # Placeholder text shown in the prompt; not a path.
+                # shellcheck disable=SC2088
+                extra_input=$(ask_text "~/path/to/folder   (append :ro for read-only)")
+                [[ -n "$extra_input" ]] && { validate_and_add_extra_path "$extra_input" || sleep 1; }
+                ;;
+            *) break ;;
+        esac
     done
 }
 
 screen_local_path() {
     local w=56
 
-    clear
-    echo ""
-    draw_mini_logo
-    echo ""
+    screen_header
 
-    draw_box $w "LOCAL REPOSITORY"
+    draw_box $w "PICK A FOLDER"
     draw_spacer $w
-    draw_box_row $w "${C_DIM}  Enter path to a git repository${NC}"
-    draw_box_row $w "${C_DIM}  Use ${C_TEXT}.${C_DIM} for current directory${NC}"
+    draw_box_row $w "${C_DIM}  Any folder on this machine — git or not${NC}"
     draw_spacer $w
     draw_box_bottom $w
-    echo ""
 
-    local path_input
-    path_input=$(gum input --placeholder="." --value=".")
-    [[ -z "$path_input" ]] && path_input="."
+    # Anchor discovery and browsing on the current directory's neighbourhood,
+    # without ever *selecting* the current directory implicitly: arriving here
+    # usually means it was just declined.
+    local anchor="$PWD"
+    local chosen=""
 
-    LOCAL_PATH=$(abs_path_of "$path_input") || {
+    while [[ -z "$chosen" ]]; do
         echo ""
-        say_err "Directory not found: ${path_input}"
-        sleep 2
-        LOCAL_MODE=false
-        return
-    }
+        local options=()
+        local repo_count
+        repo_count=$(discover_repos "$anchor" | grep -c . || true)
+        [[ "$repo_count" -gt 0 ]] && options+=("Pick from my repos (${repo_count})")
+        options+=("Browse folders" "Type a path")
+        [[ -e "$PWD/.git" ]] && options+=("Use current folder ($(basename "$PWD"))")
+        options+=("← Back")
+
+        local how
+        how=$(pick_one "Which folder should the sandbox work in?" "${options[@]}")
+
+        case "$how" in
+            "Pick from my repos"*)
+                local candidates=() dir
+                while IFS= read -r dir; do
+                    [[ -n "$dir" ]] && candidates+=("$(display_path "$dir")")
+                done < <(discover_repos "$anchor")
+
+                local sel
+                sel=$(pick_one "Pick a repo" "${candidates[@]}")
+                [[ -n "$sel" ]] && chosen="$(resolve_display_path "$sel")"
+                ;;
+            "Browse folders")
+                local picked
+                # Capture whole, then take the first line: piping into `head`
+                # would SIGPIPE the browser and, with pipefail, fail the
+                # assignment outright.
+                picked=$(browse_directories "$(dirname "$anchor")") || true
+                [[ -n "$picked" ]] && chosen="$(printf '%s\n' "$picked" | head -1)"
+                ;;
+            "Type a path")
+                local typed
+                # Placeholder text, not a path to expand.
+                # shellcheck disable=SC2088
+                typed=$(ask_text "~/path/to/folder")
+                [[ -z "$typed" ]] && continue
+                chosen=$(abs_path_of "$typed") || {
+                    say_err "Directory not found: ${typed}"
+                    chosen=""
+                    sleep 1
+                }
+                ;;
+            "Use current folder"*)
+                chosen="$PWD"
+                ;;
+            *)
+                LOCAL_MODE=false
+                return 0
+                ;;
+        esac
+    done
+
+    LOCAL_PATH="$chosen"
 
     local root
     root=$(git_root_of "$LOCAL_PATH") || true
@@ -1206,13 +1749,12 @@ screen_local_path() {
 
     echo ""
     if [[ -n "$root" ]]; then
-        say_ok "Found git repo: ${C_ACCENT}${SELECTED_REPO}${NC}"
+        say_ok "Working in ${C_ACCENT}${SELECTED_REPO}${NC} ${C_DIM}$(display_path "$LOCAL_PATH")${NC}"
     else
         say_warn "Not a git repo: ${C_ACCENT}${SELECTED_REPO}${NC} ${C_DIM}(no branches or auto-save)${NC}"
         AUTO_GIT=false
         WORKTREE=false
     fi
-    sleep 1
 
     EXTRA_PATHS=()
     load_config_file "$LOCAL_PATH/$REPO_CONFIG_FILE"
@@ -1223,10 +1765,18 @@ screen_local_path() {
 screen_repo_select() {
     local w=56
 
-    clear
-    echo ""
-    draw_mini_logo
-    echo ""
+    ensure_gh_user
+    if [[ -z "$GH_USER" ]]; then
+        screen_header
+        say_warn "${C_TEXT}Not signed in to GitHub${NC}"
+        echo -e "     ${C_DIM}Run ${C_TEXT}gh auth login${C_DIM}, or work on a local folder instead.${NC}"
+        echo ""
+        echo -e "  ${C_DIM}Press Enter to go back...${NC}"
+        read -r
+        return 0
+    fi
+
+    screen_header
 
     draw_box $w "SELECT REPOSITORY"
     draw_spacer $w
@@ -1247,8 +1797,7 @@ screen_repo_select() {
     echo ""
 
     local choice
-    choice=$(gum choose --height=6 \
-        "Search my repos" "Enter repo name" "Paste URL" "← Back")
+    choice=$(pick_one "" "Search my repos" "Enter repo name" "Paste URL" "← Back")
 
     case "$choice" in
         "Search my repos")
@@ -1265,14 +1814,14 @@ screen_repo_select() {
 
             echo ""
             local selected
-            selected=$(echo "$repos" | gum filter --placeholder="Search repos..." --height=12)
+            selected=$(echo "$repos" | pick_filter "Search repos...")
             [[ -n "$selected" ]] && confirm_repo "$selected"
             ;;
 
         "Enter repo name")
             echo ""
             local name
-            name=$(gum input --placeholder="owner/repo")
+            name=$(ask_text "owner/repo")
 
             if [[ -n "$name" ]]; then
                 echo ""
@@ -1292,7 +1841,7 @@ screen_repo_select() {
         "Paste URL")
             echo ""
             local url
-            url=$(gum input --placeholder="git@github.com:user/repo.git")
+            url=$(ask_text "git@github.com:user/repo.git")
 
             if [[ -n "$url" ]]; then
                 SELECTED_REPO=$(basename "$url" .git)
@@ -1306,10 +1855,7 @@ confirm_repo() {
     local repo="$1"
     local w=56
 
-    clear
-    echo ""
-    draw_mini_logo
-    echo ""
+    screen_header
 
     local info info_tmpfile
     info_tmpfile=$(mktemp)
@@ -1443,11 +1989,12 @@ apply_autosave_default() {
 
 screen_launch_confirm() {
     apply_autosave_default
-    clear
-    echo ""
-    draw_mini_logo
-    echo ""
+    screen_header
 
+    if [[ "$LOCAL_MODE" == true ]]; then
+        draw_selection_panel
+        echo ""
+    fi
     draw_launch_summary
 
     echo ""
@@ -1667,10 +2214,7 @@ launch_sandbox() {
     [[ -n "$EXEC_PROMPT" ]] && headless=true
 
     if [[ "$DRY_RUN" != true && "$headless" != true ]]; then
-        clear
-        echo ""
-        draw_mini_logo
-        echo ""
+        screen_header
         echo -e "  ${C_ACCENT}▸${NC} Preparing sandbox..."
     fi
 
@@ -1731,10 +2275,7 @@ screen_main_menu() {
     local w=56
 
     while true; do
-        clear
-        echo ""
-        draw_mini_logo
-        echo ""
+        screen_header
 
         draw_box $w "STATUS"
         draw_spacer $w
@@ -1751,6 +2292,7 @@ screen_main_menu() {
                 draw_box_row $w "  ${C_DIM}${RING}${NC} ${C_DIM}Repository${NC}    ${C_DIM}None selected${NC}"
             fi
         else
+            ensure_gh_user
             if [[ -n "$GH_USER" ]]; then
                 draw_box_row $w "  ${C_SUCCESS}${DOT}${NC} ${C_DIM}GitHub${NC}        ${C_ACCENT}@${GH_USER}${NC}"
             else
@@ -1789,7 +2331,7 @@ screen_main_menu() {
         options+=("❌  Exit")
 
         local choice
-        choice=$(printf '%s\n' "${options[@]}" | gum choose --height=10)
+        choice=$(pick_one "" "${options[@]}")
 
         case "$choice" in
             "🚀  Launch Sandbox")
@@ -1803,6 +2345,7 @@ screen_main_menu() {
             "📂  Select Directory")  screen_local_path ;;
             "🔄  Switch to GitHub")
                 LOCAL_MODE=false
+                ensure_gh_user
                 LOCAL_PATH=""; SELECTED_REPO=""; SELECTED_REPO_URL=""; EXTRA_PATHS=()
                 [[ -z "$GH_USER" ]] && refresh_gh_user
                 ;;
@@ -1829,7 +2372,7 @@ screen_main_menu() {
                 read -r
                 ;;
             "❌  Exit")
-                clear
+                clear_screen
                 echo ""
                 echo -e "  ${C_DIM}Goodbye.${NC}"
                 echo ""
@@ -1842,10 +2385,7 @@ screen_main_menu() {
 screen_switch_account() {
     local w=56
 
-    clear
-    echo ""
-    draw_mini_logo
-    echo ""
+    screen_header
 
     local accounts
     accounts=$(get_all_accounts)
@@ -1867,21 +2407,23 @@ screen_switch_account() {
     echo ""
 
     local selected
-    selected=$(printf '%s\n+ Add new account\n' "$accounts" | gum choose --height=6)
+    local account_items=()
+    while IFS= read -r acct; do
+        [[ -n "$acct" ]] && account_items+=("$acct")
+    done <<< "$accounts"
+    account_items+=("+ Add new account" "← Back")
+    selected=$(pick_one "" "${account_items[@]}")
 
-    if [[ "$selected" == "+ Add new account" ]]; then
-        gh auth login
-    elif [[ -n "$selected" ]]; then
-        gh auth switch --user "$selected" 2>/dev/null || true
-    fi
+    case "$selected" in
+        "+ Add new account") gh auth login ;;
+        ""|"← Back")         return 0 ;;
+        *)                   gh auth switch --user "$selected" 2>/dev/null || true ;;
+    esac
 
     refresh_gh_user
 
     if [[ -n "$GH_USER" ]]; then
-        clear
-        echo ""
-        draw_mini_logo
-        echo ""
+        screen_header
         draw_user_card "$GH_USER"
         echo ""
         echo -e "  ${C_DIM}Press Enter to continue...${NC}"
@@ -2091,6 +2633,12 @@ cmd_doctor() {
         ok=false
     fi
 
+    if command -v fzf &>/dev/null; then
+        say_ok "fzf ${C_DIM}(folder browser with previews)${NC}"
+    else
+        say_dim "fzf not installed — folder browsing falls back to a plain list"
+    fi
+
     if gh auth status &>/dev/null; then
         say_ok "GitHub CLI authenticated"
     else
@@ -2174,10 +2722,7 @@ detect_current_repo() {
     fi
 
     local w=56
-    clear
-    echo ""
-    draw_mini_logo
-    echo ""
+    screen_header
 
     draw_box $w "CURRENT DIRECTORY"
     draw_spacer $w
@@ -2211,7 +2756,7 @@ check_deps() {
     command -v jq &>/dev/null || missing+=("jq")
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        clear
+        clear_screen
         draw_logo
         echo ""
         say_err "${C_TEXT}Missing dependencies:${NC}"

@@ -45,6 +45,7 @@ What Claude Sandbox does give you:
 - **Docker** — [OrbStack](https://orbstack.dev/) (recommended) or Docker Desktop
 - **macOS** or **Linux**
 - `gh`, `gum`, `jq` — the installer offers to install these
+- `fzf` — optional, adds the drill-down folder browser with previews
 - A Claude Code subscription or API key
 
 ## Install
@@ -62,6 +63,8 @@ This installs a pinned release, verifies it against the published `SHA256SUMS`, 
 ./install.sh --uninstall
 ```
 
+`cs` starts instantly. The GitHub identity is looked up only when you actually reach for GitHub — a local session never contacts it.
+
 ## Usage
 
 ### Local folders
@@ -72,6 +75,17 @@ cs ~/projects/my-app      # any folder — git or not
 cs . -w                   # worktree mode: your checkout is never touched
 cs . -m ~/work/api -m ~/notes:ro    # mount siblings, some read-only
 ```
+
+Interactively, `cs` finds every git repo near the one you picked — its siblings *and* its cousins, so `~/work/api`, `~/work/team-b/web` and `~/side/notes` all show up in one list. Type a few letters, `tab` to select several, enter. The picker is a loop — add a few repos, browse for a non-git folder, type a path, repeat, then pick `Done`. `Browse folders` opens a two-pane picker over everything from `~` down: folders on the left, a live preview of the highlighted one on the right, git repos marked `[repo]`. Type to narrow, `space` or `tab` to mark as many as you like from anywhere in the list, enter takes them all. Pick `Browse folders (read-only)` to mount that batch read-only. Non-git folders — notes, data, design assets — mount fine this way. Needs `fzf`; without it you get a plain single-column list.
+
+Tune the search if your repos live elsewhere or nest deeply:
+
+```ini
+REPO_ROOTS=~/knowledge,~/clients   # extra trees to search
+REPO_DEPTH=5                       # default 5; ~/work/<group>/<area>/<repo> needs 4+
+```
+
+Marked the wrong folder? `space` un-marks it inside the picker, and `Remove a mount` in the menu drops one after it has been added.
 
 Recent workspaces are remembered along with their mounts, so a multi-repo session is one pick away next time.
 
@@ -178,6 +192,7 @@ Off by default — most sessions do not need it.
 | `--browser` | Headless Chromium + Playwright MCP |
 | `--update-tools` | Update agent CLIs at startup |
 | `--snapshot` | Record the working tree first (see below) |
+| `REPO_ROOTS=` (config) | Extra trees to search when picking mounts |
 | `--network <mode>` / `-p a:b` | Networking |
 | `--image <ref>` / `--pull` / `--no-pull` | Image selection |
 | `--dry-run` | Print the docker command and exit |

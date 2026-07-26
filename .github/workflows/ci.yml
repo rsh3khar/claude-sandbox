@@ -24,7 +24,8 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/work" -w /work koalaman/shellcheck:stable \
             --severity=warning \
-            claude-sandbox install.sh runtime/entrypoint.sh runtime/auto-git.sh tests/image-smoke.sh
+            claude-sandbox install.sh runtime/entrypoint.sh runtime/auto-git.sh \
+            tests/image-smoke.sh tests/portability.sh
 
       - name: hadolint
         run: |
@@ -41,6 +42,18 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/work" -w /work --entrypoint sh bats/bats:latest \
             -c 'apk add --no-cache git >/dev/null 2>&1; exec bats tests/unit'
+
+  portability:
+    name: Portability (macOS bash 3.2)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System bash version
+        run: /bin/bash --version | head -1
+
+      - name: Pure-function checks under bash 3.2
+        run: ./tests/portability.sh /bin/bash
 
   image:
     name: Build & smoke-test image

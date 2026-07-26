@@ -11,7 +11,7 @@ IMAGE       ?= claude-sandbox
 REGISTRY    ?= ghcr.io/rsh3khar/claude-sandbox
 VERSION     := $(shell sed -n 's/^VERSION="\(.*\)".*/\1/p' claude-sandbox | head -1)
 VCS_REF     := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
-SHELL_FILES := claude-sandbox install.sh runtime/entrypoint.sh runtime/auto-git.sh tests/image-smoke.sh
+SHELL_FILES := claude-sandbox install.sh runtime/entrypoint.sh runtime/auto-git.sh tests/image-smoke.sh tests/portability.sh
 
 DOCKER_RUN := docker run --rm -v "$(PWD):/work" -w /work
 
@@ -83,9 +83,15 @@ test-image: build
 	@echo "==> image smoke tests"
 	@IMAGE=$(IMAGE) ./tests/image-smoke.sh
 
-## check: lint + test (run before pushing)
+## portability: Run pure-function checks under the system bash (3.2 on macOS)
+.PHONY: portability
+portability:
+	@echo "==> portability (system bash)"
+	@./tests/portability.sh /bin/bash
+
+## check: lint + test + portability (run before pushing)
 .PHONY: check
-check: lint test
+check: lint test portability
 # fmt-check is deliberately not part of `check` or CI. This codebase aligns
 # case arms and box-drawing calls into columns on purpose, and shfmt collapses
 # that. shellcheck is what catches real defects; formatting stays a judgement

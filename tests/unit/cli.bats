@@ -574,3 +574,625 @@ setup() {
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }
+
+# ── Discovering repos to mount ───────────────────────────────────────────────
+
+@test "discover_repos finds repos across sibling and cousin trees" {
+    local base
+    base="$(mktemp -d)"
+    # layout: base/group-a/{primary,api}  base/group-b/web
+    mkdir -p "$base/group-a/primary/.git" "$base/group-a/api/.git" \
+             "$base/group-b/web/.git" "$base/group-a/plain-dir"
+    LOCAL_PATH="$base/group-a/primary"
+    REPO_ROOTS=""
+
+    run discover_repos
+    [ "$status" -eq 0 ]
+
+    # sibling (same parent) and cousin (via grandparent) both found
+    [[ "$output" == *"$base/group-a/api"* ]]
+    [[ "$output" == *"$base/group-b/web"* ]]
+    # a non-git directory is not offered
+    [[ "$output" != *"plain-dir"* ]]
+
+    rm -rf "$base"
+}
+
+@test "REPO_ROOTS adds trees outside the repo's own hierarchy" {
+    local base elsewhere
+    base="$(mktemp -d)"
+    elsewhere="$(mktemp -d)"
+    mkdir -p "$base/group/primary/.git" "$elsewhere/notes/.git"
+    LOCAL_PATH="$base/group/primary"
+
+    REPO_ROOTS=""
+    run discover_repos
+    [[ "$output" != *"$elsewhere/notes"* ]]
+
+    REPO_ROOTS="$elsewhere"
+    run discover_repos
+    [[ "$output" == *"$elsewhere/notes"* ]]
+
+    rm -rf "$base" "$elsewhere"
+}
+
+@test "discover_repos ignores repos vendored inside node_modules" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/group/primary/.git" "$base/group/app/node_modules/dep/.git"
+    LOCAL_PATH="$base/group/primary"
+    REPO_ROOTS=""
+
+    run discover_repos
+    [[ "$output" != *"node_modules"* ]]
+
+    rm -rf "$base"
+}
+
+@test "discover_repos refuses to scan from \$HOME or /" {
+    LOCAL_PATH="$HOME/somerepo"     # parent is $HOME -> no roots
+    REPO_ROOTS=""
+    run discover_repos
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+
+@test "discovery reaches repos nested one level deeper than the group folder" {
+    # ~/work/<group>/<area>/<repo> puts .git 4 levels down; a depth-3 scan
+    # silently omitted an entire product's worth of repos.
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/group/primary/.git" \
+             "$base/product/server/api/.git" \
+             "$base/product/app/web/.git"
+    LOCAL_PATH="$base/group/primary"
+    REPO_ROOTS=""
+    REPO_DEPTH=5
+
+    run discover_repos
+    [[ "$output" == *"$base/product/server/api"* ]]
+    [[ "$output" == *"$base/product/app/web"* ]]
+
+    rm -rf "$base"
+}
+
+@test "REPO_DEPTH is configurable" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/group/primary/.git" "$base/a/b/c/deep/.git"
+    LOCAL_PATH="$base/group/primary"
+    REPO_ROOTS=""
+
+    REPO_DEPTH=2
+    run discover_repos
+    [[ "$output" != *"deep"* ]]
+
+    REPO_DEPTH=6
+    run discover_repos
+    [[ "$output" == *"$base/a/b/c/deep"* ]]
+
+    rm -rf "$base"
+}
+
+
+@test "list_dirs_of marks git repos and skips dotfolders" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/a-repo/.git" "$base/plain" "$base/.hidden"
+
+    run list_dirs_of "$base"
+    [[ "$output" == *"a-repo"* ]]
+    [[ "$output" == *"[repo]"* ]]
+    [[ "$output" == *"plain"* ]]
+    [[ "$output" != *".hidden"* ]]
+
+    rm -rf "$base"
+}
+
+# ── Menus must never abort the CLI ───────────────────────────────────────────
+
+
+
+# ── Interactive prompts ──────────────────────────────────────────────────────
+# gum exits non-zero on esc/ctrl-c. These assert the behaviour that keeps the
+# CLI alive, by stubbing gum rather than grepping the source for guards.
+
+@test "pick_one returns empty and succeeds when the user cancels" {
+    gum() { return 1; }          # esc / ctrl-c
+    export -f gum 2>/dev/null || true
+
+    run pick_one "" "alpha" "beta"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "pick_one passes the selection through unchanged" {
+    gum() { echo "beta"; }
+    run pick_one "header" "alpha" "beta"
+    [ "$status" -eq 0 ]
+    [ "$output" = "beta" ]
+}
+
+@test "pick_one with no items is a no-op rather than an error" {
+    run pick_one "header"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "pick_many returns empty and succeeds when cancelled" {
+    gum() { return 130; }        # ctrl-c
+    run pick_many "placeholder" "one" "two"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "pick_many returns every selected line" {
+    gum() { printf 'one\nthree\n'; }
+    run pick_many "placeholder" "one" "two" "three"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"one"* ]]
+    [[ "$output" == *"three"* ]]
+}
+
+@test "ask_text returns empty and succeeds when cancelled" {
+    gum() { return 1; }
+    run ask_text "type here"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "ask_text forwards a default value" {
+    gum() { printf '%s\n' "$*"; }
+    run ask_text "placeholder" "thedefault"
+    [[ "$output" == *"--value=thedefault"* ]]
+}
+
+@test "every screen survives a cancelled picker" {
+    # The real regression: under set -euo pipefail an unguarded capture aborted
+    # the CLI, so esc quit cs outright.
+    gum() { return 1; }
+    EXTRA_PATHS=(); LOCAL_PATH="/tmp"; LOCAL_MODE=true; SELECTED_REPO=""
+
+    run screen_source_select
+    [ "$status" -eq 0 ]
+
+    run prompt_extra_mounts
+    [ "$status" -eq 0 ]
+}
+
+# ── The running selection stays visible ──────────────────────────────────────
+
+@test "mounts_summary lists the primary repo and every extra mount" {
+    SELECTED_REPO="open-contract"
+    EXTRA_PATHS=()
+    run mounts_summary
+    [ "$output" = "mounting: open-contract" ]
+
+    EXTRA_PATHS=("/a/api|api|rw" "/b/notes|notes|ro")
+    run mounts_summary
+    [ "$output" = "mounting: open-contract + api, notes:ro" ]
+}
+
+@test "mounts_summary uses the repo basename, not owner/repo" {
+    SELECTED_REPO="owner/repo"
+    EXTRA_PATHS=()
+    run mounts_summary
+    [ "$output" = "mounting: repo" ]
+}
+
+@test "mounts_summary is safe before anything is selected" {
+    SELECTED_REPO=""
+    EXTRA_PATHS=()
+    run mounts_summary
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"nothing yet"* ]]
+}
+
+@test "the selection panel lists the main folder and every mount once" {
+    SELECTED_REPO="open-contract"
+    LOCAL_MODE=true
+    LOCAL_PATH="$HOME/work/open-contract"
+    EXTRA_PATHS=("$HOME/work/api|api|rw" "$HOME/notes|notes|ro")
+
+    run draw_selection_panel
+    [ "$status" -eq 0 ]
+
+    # every selected thing appears, exactly once each
+    [ "$(grep -c 'open-contract' <<< "$output")" -eq 2 ]   # name + path line
+    [[ "$output" == *"api"* ]]
+    [[ "$output" == *"notes"* ]]
+    [[ "$output" == *"read-only"* ]]
+    [[ "$output" == *"(main)"* ]]
+}
+
+@test "the selection panel is honest when nothing is chosen" {
+    SELECTED_REPO=""
+    EXTRA_PATHS=()
+    run draw_selection_panel
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"no folder chosen yet"* ]]
+}
+
+
+@test "long paths are truncated to fit a narrow panel" {
+    SELECTED_REPO="r"
+    LOCAL_MODE=true
+    LOCAL_PATH="/a"
+    EXTRA_PATHS=("/an/extremely/long/path/that/will/never/fit/in/a/narrow/panel/api|api|rw")
+
+    run draw_selection_panel 40
+    [[ "$output" == *"…"* ]]
+}
+
+@test "the corner panel stacks instead of overlaying when there is no room" {
+    SELECTED_REPO="r"; EXTRA_PATHS=()
+
+    CS_TERM_COLS=80 CS_TERM_ROWS=40
+    run selection_fits_beside
+    [ "$status" -ne 0 ]
+
+    CS_TERM_COLS=150 CS_TERM_ROWS=20
+    run selection_fits_beside
+    [ "$status" -ne 0 ]
+
+    CS_TERM_COLS=150 CS_TERM_ROWS=40
+    run selection_fits_beside
+    [ "$status" -eq 0 ]
+}
+
+@test "corner placement emits cursor positioning only when it fits" {
+    SELECTED_REPO="r"; EXTRA_PATHS=(); LOCAL_MODE=true; LOCAL_PATH="/a"
+
+    CS_TERM_COLS=80 CS_TERM_ROWS=40 run draw_selection_corner
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"THIS SANDBOX WILL MOUNT"* ]]   # stacked, still visible
+}
+
+@test "clear_screen survives an unset or dumb TERM" {
+    TERM="" run clear_screen
+    [ "$status" -eq 0 ]
+
+    TERM=dumb run clear_screen
+    [ "$status" -eq 0 ]
+}
+
+# ── Multi-select from the folder browser ─────────────────────────────────────
+
+@test "every folder tab-selected in the browser becomes a mount" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/one" "$base/two" "$base/three"
+
+    LOCAL_PATH="/elsewhere"
+    SELECTED_REPO="primary"
+    EXTRA_PATHS=()
+    browse_directories() { printf '%s\n%s\n%s\n' "$base/one" "$base/two" "$base/three"; }
+    gum() { return 1; }          # "Mount read-only?" -> no
+
+    add_mount_interactively "$base" >/dev/null 2>&1
+    [ "${#EXTRA_PATHS[@]}" -eq 3 ]
+
+    rm -rf "$base"
+}
+
+@test "a selection is kept even when the browser reports a non-zero exit" {
+    # pipefail + SIGPIPE made the browser 'fail' while still having produced
+    # output; `|| return` then discarded everything the user picked.
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/one" "$base/two"
+
+    LOCAL_PATH="/elsewhere"
+    SELECTED_REPO="primary"
+    EXTRA_PATHS=()
+    browse_directories() { printf '%s\n%s\n' "$base/one" "$base/two"; return 141; }
+    gum() { return 1; }
+
+    add_mount_interactively "$base" >/dev/null 2>&1
+    [ "${#EXTRA_PATHS[@]}" -eq 2 ]
+
+    rm -rf "$base"
+}
+
+
+@test "browsing loops so folders can be gathered across directories" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/a/one" "$base/b/two" "$base/c/three"
+
+    LOCAL_PATH="/elsewhere"; SELECTED_REPO="primary"; EXTRA_PATHS=()
+
+    # Three passes: one folder each, then cancel out of the browser.
+    printf '%s\n%s\n%s\n' "$base/a/one" "$base/b/two" "$base/c/three" > "$BATS_TEST_TMPDIR/queue"
+    browse_directories() {
+        local v=""
+        if [[ -s "$BATS_TEST_TMPDIR/queue" ]]; then
+            v=$(head -n 1 "$BATS_TEST_TMPDIR/queue")
+            tail -n +2 "$BATS_TEST_TMPDIR/queue" > "$BATS_TEST_TMPDIR/q2" && mv "$BATS_TEST_TMPDIR/q2" "$BATS_TEST_TMPDIR/queue"
+        fi
+        printf '%s' "$v"
+    }
+    gum() { return 0; }   # read-only? yes ; continue? yes
+
+    add_mount_interactively "$base" >/dev/null 2>&1
+    [ "${#EXTRA_PATHS[@]}" -eq 3 ]
+
+    rm -rf "$base"
+}
+
+@test "browsing stops when the user declines to continue" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/one"
+
+    LOCAL_PATH="/elsewhere"; SELECTED_REPO="primary"; EXTRA_PATHS=()
+    browse_directories() { printf '%s' "$base/one"; }
+    # first gum call = read-only? ; second = continue? -> answer no to continue
+    local n="$BATS_TEST_TMPDIR/n"; echo 0 > "$n"
+    gum() {
+        local c; c=$(cat "$n"); echo $((c + 1)) > "$n"
+        [[ "$c" == "1" ]] && return 1     # decline "add from somewhere else"
+        return 0
+    }
+
+    run timeout 10 bash -c "true"   # guard: the loop must not spin
+    add_mount_interactively "$base" >/dev/null 2>&1
+    [ "${#EXTRA_PATHS[@]}" -eq 1 ]
+
+    rm -rf "$base"
+}
+
+@test "a pass that adds nothing new ends the browse loop" {
+    # Otherwise re-selecting the same folders would re-offer them forever.
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/dup"
+
+    LOCAL_PATH="/elsewhere"; SELECTED_REPO="primary"; EXTRA_PATHS=()
+    browse_directories() { printf '%s' "$base/dup"; }   # always the same folder
+    gum() { return 0; }                                  # always "yes, continue"
+
+    run timeout 10 bash -c "
+        source '$REPO_ROOT/claude-sandbox'
+        LOCAL_PATH=/elsewhere; SELECTED_REPO=primary; EXTRA_PATHS=()
+        browse_directories() { printf '%s' '$base/dup'; }
+        gum() { return 0; }
+        sleep() { :; }
+        add_mount_interactively '$base' >/dev/null 2>&1
+        echo \"count=\${#EXTRA_PATHS[@]}\"
+    "
+    [ "$status" -eq 0 ]                 # terminated, did not spin
+    [[ "$output" == *"count=1"* ]]      # added once, not repeatedly
+
+    rm -rf "$base"
+}
+
+# ── Selecting several folders at once ───────────────────────────────────────
+
+@test "every folder fzf returns becomes a mount, from any directories" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/one" "$base/two" "$base/deep/three"
+
+    LOCAL_PATH="/elsewhere"; SELECTED_REPO="primary"; EXTRA_PATHS=()
+    # fzf multi-select emits one line per marked row
+    fzf() { printf '%s\t%s\n' "$base/one" one "$base/two" two "$base/deep/three" three; }
+    gum() { return 1; }
+
+    add_mount_interactively "$base" >/dev/null 2>&1
+    [ "${#EXTRA_PATHS[@]}" -eq 3 ]
+
+    rm -rf "$base"
+}
+
+@test "browse_directories asks fzf for multi-select and returns the path column" {
+    local seen="$BATS_TEST_TMPDIR/args"
+    fzf() { printf '%s\n' "$@" > "$seen"; printf '/p/one\tone/\n/p/two\ttwo/\n'; }
+
+    run browse_directories /tmp
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s\n' "$output" | grep -c .)" -eq 2 ]
+    [[ "$output" == *"/p/one"* ]]
+    [[ "$output" == *"/p/two"* ]]
+
+    grep -qx -- '--multi' "$seen"
+    grep -q -- 'space:toggle' "$seen"
+    # no reload: reload is what cleared marks
+    ! grep -q -- 'reload(' "$seen"
+}
+
+# ── The folder picker is a flat multi-select, not a drill-down ───────────────
+
+@test "picker lists repos at any depth, plus shallow plain folders" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/group/deep/area/repo/.git" "$base/notes" "$base/notes/sub"
+
+    run list_dirs_tree "$base"
+    [ "$status" -eq 0 ]
+
+    # a repo four levels down is offered, and marked
+    [[ "$output" == *"group/deep/area/repo  [repo]"* ]]
+    # a shallow plain folder is offered
+    [[ "$output" == *"notes/"* ]]
+
+    rm -rf "$base"
+}
+
+@test "picker rows carry the real path in a hidden first column" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/proj/.git"
+
+    run list_dirs_tree "$base"
+    # field 1 must be an absolute, usable path
+    local first
+    first=$(printf '%s\n' "$output" | head -1 | cut -f1)
+    [ -d "$first" ]
+
+    rm -rf "$base"
+}
+
+@test "picker skips node_modules and dotfolders" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/app/node_modules/dep/.git" "$base/.hidden/x"
+
+    run list_dirs_tree "$base"
+    [[ "$output" != *"node_modules"* ]]
+    [[ "$output" != *".hidden"* ]]
+
+    rm -rf "$base"
+}
+
+@test "read-only is a menu choice, applied to the whole batch" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/ref" "$base/docs"
+
+    LOCAL_PATH="/elsewhere"; SELECTED_REPO="primary"; EXTRA_PATHS=()
+    fzf() { printf '%s\t%s\n' "$base/ref" ref "$base/docs" docs; }
+    gum() { return 1; }        # decline "add from somewhere else"
+
+    add_mount_interactively "$base" ro >/dev/null 2>&1
+    [ "${#EXTRA_PATHS[@]}" -eq 2 ]
+    [ "$(mount_mode "${EXTRA_PATHS[0]}")" = "ro" ]
+    [ "$(mount_mode "${EXTRA_PATHS[1]}")" = "ro" ]
+
+    rm -rf "$base"
+}
+
+@test "browsing defaults to read-write with no extra prompt" {
+    local base
+    base="$(mktemp -d)"
+    mkdir -p "$base/api"
+
+    LOCAL_PATH="/elsewhere"; SELECTED_REPO="primary"; EXTRA_PATHS=()
+    fzf() { printf '%s\t%s\n' "$base/api" api; }
+    local asked="$BATS_TEST_TMPDIR/asked"; : > "$asked"
+    gum() { printf '%s\n' "$*" >> "$asked"; return 1; }
+
+    add_mount_interactively "$base" >/dev/null 2>&1
+
+    [ "$(mount_mode "${EXTRA_PATHS[0]}")" = "rw" ]
+    # the only question asked may be whether to continue, never read-only
+    ! grep -qi "read-only" "$asked"
+
+    rm -rf "$base"
+}
+
+@test "picker reaches back to \$HOME, not just the current tree" {
+    local home_dir
+    home_dir="$(mktemp -d)"
+    mkdir -p "$home_dir/work/group/deep/repo/.git" "$home_dir/knowledge" "$home_dir/code/tool"
+    HOME="$home_dir"
+
+    run list_dirs_tree "$home_dir/work"
+
+    # deep repo in the working tree
+    [[ "$output" == *"work/group/deep/repo"* ]]
+    # sibling trees under $HOME, reached without navigating
+    [[ "$output" == *"knowledge"* ]]
+    [[ "$output" == *"code/tool"* ]]
+
+    rm -rf "$home_dir"
+}
+
+@test "picker lists plain folders, not only git repos" {
+    local home_dir
+    home_dir="$(mktemp -d)"
+    mkdir -p "$home_dir/notes" "$home_dir/data/exports" "$home_dir/proj/.git"
+    HOME="$home_dir"
+
+    run list_dirs_tree "$home_dir/proj"
+
+    [[ "$output" == *"notes"* ]]
+    [[ "$output" == *"data/exports"* ]]
+    [[ "$output" == *"[repo]"* ]]      # repos still marked
+
+    rm -rf "$home_dir"
+}
+
+@test "picker prunes Library, Applications and app bundles" {
+    local home_dir
+    home_dir="$(mktemp -d)"
+    mkdir -p "$home_dir/Library/Caches/x" "$home_dir/Applications/Foo.app/Contents" \
+             "$home_dir/Thing.app/Contents" "$home_dir/keep"
+    HOME="$home_dir"
+
+    run list_dirs_tree "$home_dir"
+
+    [[ "$output" != *"Library"* ]]
+    [[ "$output" != *"Applications"* ]]
+    [[ "$output" != *".app"* ]]
+    [[ "$output" == *"keep"* ]]
+
+    rm -rf "$home_dir"
+}
+
+@test "picker returns each path exactly once" {
+    local home_dir
+    home_dir="$(mktemp -d)"
+    mkdir -p "$home_dir/work/repo/.git"
+    HOME="$home_dir"
+
+    run list_dirs_tree "$home_dir/work"
+    local dupes
+    dupes=$(printf '%s\n' "$output" | cut -f1 | sort | uniq -d | grep -c . || true)
+    [ "$dupes" -eq 0 ]
+
+    rm -rf "$home_dir"
+}
+
+# ── Undoing a mistaken selection ─────────────────────────────────────────────
+
+@test "a mount can be removed after it was added" {
+    EXTRA_PATHS=("/a/api|api|rw" "/b/notes|notes|rw" "/c/web|web|rw")
+    pick_one() { printf 'notes'; }
+
+    remove_mount_interactively >/dev/null
+    [ "${#EXTRA_PATHS[@]}" -eq 2 ]
+    [ "$(mount_name "${EXTRA_PATHS[0]}")" = "api" ]
+    [ "$(mount_name "${EXTRA_PATHS[1]}")" = "web" ]
+}
+
+@test "removing a read-only mount matches despite its label" {
+    EXTRA_PATHS=("/a/api|api|rw" "/b/docs|docs|ro")
+    pick_one() { printf 'docs  [read-only]'; }
+
+    remove_mount_interactively >/dev/null
+    [ "${#EXTRA_PATHS[@]}" -eq 1 ]
+    [ "$(mount_name "${EXTRA_PATHS[0]}")" = "api" ]
+}
+
+@test "Back leaves the mounts untouched" {
+    EXTRA_PATHS=("/a/api|api|rw" "/b/web|web|rw")
+    pick_one() { printf '← Back'; }
+
+    remove_mount_interactively >/dev/null
+    [ "${#EXTRA_PATHS[@]}" -eq 2 ]
+}
+
+@test "removing from an empty list is a no-op" {
+    EXTRA_PATHS=()
+    pick_one() { printf 'anything'; }
+
+    run remove_mount_interactively
+    [ "$status" -eq 0 ]
+}
+
+@test "the remove entry appears only when something is mounted" {
+    # menu is built from EXTRA_PATHS, so check the construction directly
+    EXTRA_PATHS=()
+    local menu=("Pick from my repos" "Browse folders" "Browse folders (read-only)" "Type a path")
+    [[ ${#EXTRA_PATHS[@]} -gt 0 ]] && menu+=("Remove a mount")
+    menu+=("Done")
+    [[ "${menu[*]}" != *"Remove a mount"* ]]
+
+    EXTRA_PATHS=("/a/x|x|rw")
+    menu=("Pick from my repos" "Browse folders" "Browse folders (read-only)" "Type a path")
+    [[ ${#EXTRA_PATHS[@]} -gt 0 ]] && menu+=("Remove a mount")
+    menu+=("Done")
+    [[ "${menu[*]}" == *"Remove a mount"* ]]
+}

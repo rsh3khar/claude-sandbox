@@ -274,6 +274,20 @@ if [[ "$SKIP_DEPS" == "false" ]]; then
         fi
     fi
 
+    # Recommended, not required: enables the drill-down folder browser with a
+    # preview pane. Everything works without it, just with a plainer picker.
+    if check_cmd fzf; then
+        say_ok "fzf ${C_DIM}(folder browser)${NC}"
+    else
+        say_warn "fzf not found ${C_DIM}— optional, enables the folder browser with previews${NC}"
+        if [[ "$HAS_BREW" == "true" || "$OS" == "linux" ]]; then
+            read -r -p "  Install fzf? [y/N] " -n 1 REPLY
+            echo ""
+            [[ $REPLY =~ ^[Yy]$ ]] && install_dep fzf
+        fi
+    fi
+    echo ""
+
     echo -e "${C_TEXT}Checking GitHub authentication...${NC}"
     if gh auth status &>/dev/null; then
         GH_USER=$(gh api user --jq '.login' 2>/dev/null || echo "unknown")
